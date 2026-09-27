@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from session_index import connect, launch, main, parse_session, resolve, search, sync
+import curses
+import sqlite3
+
+import session_index
+from session_index import (Picker, connect, launch, main, parse_session, resolve, search, sync,
+                           with_default_command)
 
 
 class SessionIndexTests(unittest.TestCase):
@@ -111,6 +116,92 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(parse_session("claude", path)["title"], "Visible request")
         self.assertEqual(sync(self.db, self.sources), (1, 0))
         self.assertEqual(search(self.db, "ignore me"), [])
+
+
+    def cli(self, *args):
+        options = ["--db", str(self.root / "cli.sqlite3"), "--pi-dir", str(self.pi),
+                   "--claude-dir", str(self.claude)]
+        with patch("builtins.print") as printed, patch.object(session_index, "interactive", return_value=False):
+            code = main(options + list(args))
+        return code, "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
+
+    def pi_session(self, sid, cwd, text):
+        self.write_lines(self.pi / f"2026_{sid}.jsonl", [
+            {"type": "session", "id": sid, "cwd": str(cwd)},
+            {"type": "message", "message": {"role": "user", "content": text}},
+        ])
+
+    def test_bare_words_search_and_commands_still_route(self):
+        self.assertEqual(with_default_command(["billbee"]), ["pick", "billbee"])
+        self.assertEqual(with_default_command([]), ["pick"])
+        self.assertEqual(with_default_command(["--db", "x", "-b"]), ["--db", "x", "pick", "-b"])
+        self.assertEqual(with_default_command(["--db=x", "sync"]), ["--db=x", "sync"])
+        self.assertEqual(with_default_command(["--", "sync"]), ["pick", "--", "sync"])
+        self.pi_session("one", self.project, "Billbee invoices")
+        self.pi_session("two", self.project, "Unrelated work")
+        code, out = self.cli("billbee")
+        self.assertEqual(code, 0)
+        self.assertIn("Billbee invoices", out)
+        self.assertNotIn("Unrelated", out)
+
+    def test_project_root_recorded_and_filterable(self):
+        repo = self.root / "billbee-api"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        self.pi_session("in-repo", repo / "src", "Sync orders")
+        self.pi_session("elsewhere", self.project, "Sync orders too")
+        sync(self.db, self.sources)
+        self.assertEqual(resolve(self.db, "in-repo")["project"], str(repo))
+        self.assertEqual([r["sid"] for r in search(self.db, "sync", project="billbee")], ["in-repo"])
+        with patch("os.getcwd", return_value=str(repo / "src")):
+            self.assertEqual([r["sid"] for r in search(self.db, project=".")], ["in-repo"])
+        self.assertEqual([r["sid"] for r in search(self.db, project=str(self.project))], ["elsewhere"])
+
+    def test_old_index_gains_columns_and_backfills_project(self):
+        path = self.root / "old.sqlite3"
+        with sqlite3.connect(path) as old:
+            old.execute("""CREATE TABLE sessions (agent TEXT NOT NULL, sid TEXT NOT NULL, cwd TEXT NOT NULL,
+                title TEXT NOT NULL, description TEXT NOT NULL, source_path TEXT NOT NULL,
+                mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, updated REAL NOT NULL,
+                custom_title TEXT, note TEXT, tags TEXT NOT NULL DEFAULT '', PRIMARY KEY(agent, sid))""")
+            old.execute("INSERT INTO sessions VALUES ('pi','x',?,'t','d','/gone',0,0,0,NULL,NULL,'')",
+                        (str(self.project),))
+        conn = connect(path)
+        self.addCleanup(conn.close)
+        sync(conn, {})
+        row = resolve(conn, "x")
+        self.assertEqual((row["project"], row["bookmarked"]), (str(self.project), 0))
+
+    def test_bookmark_by_short_prefix_with_note_and_filter(self):
+        self.pi_session("01a0da86", self.project, "Half-done migration")
+        self.pi_session("99ffee00", self.project, "Finished work")
+        self.assertEqual(self.cli("bm", "01a0", "needs", "tests")[0], 0)
+        code, out = self.cli("-b")
+        self.assertIn("★ pi:01a0da86", out)
+        self.assertIn("needs tests", out)
+        self.assertNotIn("Finished", out)
+        self.assertEqual(self.cli("unbookmark", "01a0")[0], 0)
+        self.assertIn("No sessions found.", self.cli("-b")[1])
+
+    def test_picker_filters_moves_bookmarks_and_opens(self):
+        rows = [{"agent": "pi", "sid": s, "cwd": "/p", "project": "/p", "display_title": t,
+                 "display_note": "", "tags": "", "bookmarked": 0, "updated": 0}
+                for s, t in (("a", "Billbee orders"), ("b", "Billbee stock"), ("c", "Other"))]
+        toggled = []
+        picker = Picker(rows, "billbee", lambda row, value: toggled.append((row["sid"], value)))
+        self.assertEqual([r["sid"] for r in picker.visible], ["a", "b"])
+        picker.handle(curses.KEY_DOWN)
+        picker.handle(curses.KEY_DOWN)
+        self.assertEqual(picker.selected["sid"], "b")
+        picker.handle("\t")
+        self.assertEqual(toggled, [("b", True)])
+        for key in " stock":
+            picker.handle(key)
+        self.assertEqual([r["sid"] for r in picker.visible], ["b"])
+        self.assertEqual(picker.handle("\n"), "open")
+        picker.handle("\x15")
+        self.assertEqual(len(picker.visible), 3)
+        self.assertEqual(picker.handle("\x1b"), "quit")
 
 
 if __name__ == "__main__":
