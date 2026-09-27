@@ -485,9 +485,9 @@ class Picker:
         ]
 
     def render(self, width: int, height: int) -> tuple[list[str], int]:
-        """Screen lines (prompt, rows, gap, detail, hints) and the cursor column on the prompt line."""
+        """Screen lines (prompt, column names, rows, gap, detail, note, hints) and the prompt's cursor column."""
         width = max(10, width - 1)  # Never touch the last column, where terminals wrap.
-        self.page = max(1, height - 4)
+        self.page = max(1, height - 6)
         if self.index < self.top:
             self.top = self.index
         elif self.index >= self.top + self.page:
@@ -498,7 +498,8 @@ class Picker:
         info.append((f"{len(self.visible)}/{len(self.rows)}", DIM))
         prompt = [("❯ ", ACCENT), (self.query, BOLD)]
         gap = width - sum(cells(text) for text, _ in prompt + info)
-        lines = [self.paint(prompt + ([(" " * gap, "")] + info if gap > 0 else []), width)]
+        lines = [self.paint(prompt + ([(" " * gap, "")] + info if gap > 0 else []), width),
+                 self.paint([(f"    {'agent':<7}{'age':>6}  {fit('project', 18)}  title", DIM)], width)]
 
         now = datetime.now().timestamp()
         for i in range(self.top, self.top + self.page):
@@ -511,17 +512,18 @@ class Picker:
             else:
                 lines.append("")
 
+        # The block below the list lines up with the agent column, after the bar and star.
+        indent = " " * 4
         lines.append("")
         row = self.selected
         if row:
-            detail = [("  " + f"{row['agent']}:{row['sid'][:8]}", ACCENT),
-                      ("  " + row["cwd"].replace(str(Path.home()), "~", 1), PATH)]
-            if row["display_note"]:
-                detail.append(("  " + row["display_note"], NOTE))
-            lines.append(self.paint(detail, width))
+            lines.append(self.paint([(indent + f"{row['agent']}:{row['sid'][:8]}", ACCENT),
+                                     (f"  {age(row['updated'], now)}", AGE),
+                                     ("  " + row["cwd"].replace(str(Path.home()), "~", 1), PATH)], width))
+            lines.append(self.paint([(indent + row["display_note"], NOTE)], width))
         else:
-            lines.append("")
-        hints = [("  ", "")]
+            lines += ["", ""]
+        hints = [(indent, "")]
         for key, label in self.HINTS:
             hints += [(key, ACCENT), (f" {label}   ", DIM)]
         lines.append(self.paint(hints, width))
@@ -577,7 +579,7 @@ def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: s
     state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope, color)
     fd_in, fd_out = sys.stdin.fileno(), sys.stdout.fileno()
     size = os.get_terminal_size(fd_out)
-    height = max(5, min(size.lines - 1, len(rows) + 4, max(12, size.lines * 2 // 5)))
+    height = max(7, min(size.lines - 1, len(rows) + 6, max(12, size.lines * 2 // 5)))
 
     def write(text: str) -> None:
         os.write(fd_out, text.encode())
