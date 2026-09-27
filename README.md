@@ -2,7 +2,7 @@
 
 ![Session Hop terminal picker with a pixel-art rabbit](assets/session-hop-banner.png)
 
-Session Hop finds your local Pi, Claude Code, and Codex conversations across every project and puts you back in one. Type a few words, pick a session, press Enter, and you're in the right directory with the conversation resumed.
+Session Hop searches local Pi, Claude Code, and Codex conversations across projects. Run `hop`, type a few words, and press Enter to resume a session in its working directory.
 
 The command is `hop`. It reads the agents' session files and never changes them. It doesn't call an AI model or send anything over the network.
 
@@ -19,10 +19,6 @@ Any directory on your `PATH` works in place of `~/.local/bin`.
 
 ## Usage
 
-Every command first scans for new and changed session files. The first scan reads everything and can take several seconds. Later scans read only files that changed, which is usually nothing. If a scan runs longer than 200ms, a progress line shows on stderr and clears before the picker opens.
-
-Commands that act on one session, such as `bm`, `open`, and `rename`, take its session ID. The picker's footer shows the highlighted session's ID, like `pi:01a0da86`. You can type the full ID or any prefix of it that matches only one session. If a prefix matches more than one, make it longer or add the agent, as in `pi:01a0da86`, `claude:0c2f90be`, or `codex:01a0df43`.
-
 ### Browse everything
 
 ```bash
@@ -34,12 +30,12 @@ hop
 ### Search and resume
 
 ```bash
-hop billbee
+hop payments
 ```
 
 Add words to open the picker already filtered to sessions that contain all of them, in any order. Matching covers titles, descriptions, tags, IDs, agent names, and project paths. Keep typing to narrow the list, then press Enter to resume the highlighted session.
 
-`hop pick billbee` is the same thing with the command spelled out. To search for a word that is also a command name, put `--` first:
+`hop pick payments` is the same thing with the command spelled out. To search for a word that is also a command name, put `--` first:
 
 ```bash
 hop -- sync
@@ -48,7 +44,7 @@ hop -- sync
 ### Filter by project
 
 ```bash
-hop billbee -p .
+hop -p .
 ```
 
 `-p` limits results to one project. A session's project is the Git checkout that contains its working directory, so sessions started in `src/` count toward the repository they belong to. A session outside any checkout uses its own directory. Your home directory never counts as a checkout, even if it holds a dotfiles repository.
@@ -60,6 +56,12 @@ hop -p fizzy
 ```
 
 This shows sessions from every project whose name contains "fizzy".
+
+### Scans and session IDs
+
+Every command first scans for new and changed session files. The first scan reads everything and can take several seconds. Later scans read only files that changed, which is usually nothing. If a scan runs longer than 200ms, a progress line shows on stderr and clears before the picker opens.
+
+Commands that act on one session, such as `bm`, `open`, and `rename`, take its session ID. The picker's footer shows the highlighted session's ID, like `pi:01a0da86`. You can type the full ID or any prefix of it that matches only one session. If a prefix matches more than one, make it longer or add the agent, as in `pi:01a0da86`, `claude:0c2f90be`, or `codex:01a0df43`.
 
 ### Show bookmarks
 
@@ -75,7 +77,7 @@ hop -b
 hop bm 01a0da86 "finish the tests"
 ```
 
-This bookmarks the session whose ID starts with `01a0da86`. Bookmarks mark sessions you want to come back to. They show an `★` in the list. The note is optional; when you give one, it replaces the session's description. In the picker, Tab toggles the bookmark on the highlighted row.
+This bookmarks the session whose ID starts with `01a0da86`. Bookmarked sessions show a `★` in the list. The note is optional; when you give one, it replaces the session's description. In the picker, Tab toggles the bookmark on the highlighted row.
 
 ```bash
 hop unbm 01a0da86
@@ -123,7 +125,7 @@ This tags session `01a0da86` with `payments`. Tags are extra search words. Each 
 
 Titles, notes, tags, and bookmarks you set survive rescans.
 
-### Rebuild the index
+### Refresh the index
 
 ```bash
 hop sync
@@ -162,7 +164,9 @@ Session Hop reads these folders:
 
 A session with no name gets the start of your first message as its title. The description is a short excerpt of your messages, not a summary of the whole conversation.
 
-Agents wrap your messages in extra text, such as skill definitions, slash-command tags, command output, and the instructions Codex adds to every conversation. Session Hop strips those before picking a title. A bare command like `/clear` or `/qa` is skipped in favor of your next message. If a session has nothing but the command, it takes the command as its title when the agent answered, and it's left out when the agent didn't, unless you bookmarked, renamed, noted, or tagged it.
+Session Hop removes agent instructions, skill definitions, and command output before choosing a title. It skips bare slash commands when a later message is available.
+
+A session containing only a slash command appears if the agent replied or you added a bookmark, title, note, or tag.
 
 Some sessions are skipped entirely. These are Claude sub-agent sessions, Codex sub-agents, one-off `codex exec` runs, archived Codex sessions, and early 2025 Codex files that don't record a working directory.
 
