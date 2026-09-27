@@ -1,4 +1,4 @@
-"""Local index of resumable Pi and Claude Code conversations."""
+"""Session Hop: find and resume local Pi and Claude Code conversations."""
 
 from __future__ import annotations
 
@@ -17,7 +17,9 @@ import tty
 import unicodedata
 from datetime import datetime
 
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "agent-sessions"
+DATA_ROOT = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+DATA_DIR = DATA_ROOT / "session-hop"
+LEGACY_DATA_DIR = DATA_ROOT / "agent-sessions"  # Before the Session Hop rename.
 DEFAULT_DB = DATA_DIR / "index.sqlite3"
 DEFAULT_PI = Path.home() / ".pi/agent/sessions"
 DEFAULT_CLAUDE = Path.home() / ".claude/projects"
@@ -127,6 +129,12 @@ def parse_session(agent: str, path: Path) -> dict | None:
     description = first if name or ai_title else (last if last != first else first)
     return {"agent": agent, "sid": sid, "cwd": cwd, "title": title,
             "description": clean(description, 280), "path": str(path)}
+
+
+def migrate_legacy_data() -> None:
+    # An index from before the rename moves over once, keeping titles, notes, tags, and bookmarks.
+    if LEGACY_DATA_DIR.is_dir() and not DATA_DIR.exists():
+        LEGACY_DATA_DIR.rename(DATA_DIR)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -624,7 +632,7 @@ def launch(row: sqlite3.Row, dry_run: bool = False) -> None:
     if not cwd.is_dir():
         raise ValueError(f"Project directory no longer exists: {cwd}")
     if not Path(row["source_path"]).is_file():
-        raise ValueError("Session file no longer exists; run 'agent-sessions sync'.")
+        raise ValueError("Session file no longer exists; run 'hop sync'.")
     argv = resume_argv(row)
     if dry_run:
         print(f"cd {shlex.quote(str(cwd))} && {shlex.join(argv)}")
@@ -638,7 +646,7 @@ GLOBAL_OPTIONS = {"--db", "--pi-dir", "--claude-dir"}
 
 
 def with_default_command(argv: list[str]) -> list[str]:
-    # "agent-sessions billbee" means "agent-sessions pick billbee".
+    # "hop billbee" means "hop pick billbee".
     i = 0
     while i < len(argv):
         if argv[i] in GLOBAL_OPTIONS:
@@ -654,9 +662,10 @@ def with_default_command(argv: list[str]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Find and resume Pi and Claude Code sessions",
-        usage="agent-sessions [words ...] [-p PROJECT] [-b]\n       agent-sessions <command> ...",
-        epilog="Without a command, words open the interactive picker: agent-sessions billbee",
+        prog="hop",
+        description="Session Hop: find and resume Pi and Claude Code sessions",
+        usage="hop [words ...] [-p PROJECT] [-b]\n       hop <command> ...",
+        epilog="Without a command, words open the interactive picker: hop billbee",
         allow_abbrev=False)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite index path")
     parser.add_argument("--pi-dir", type=Path, default=DEFAULT_PI, help="Pi session directory")
@@ -688,6 +697,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("find", "pick") and args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
     try:
+        if args.db == DEFAULT_DB:
+            migrate_legacy_data()
         conn = connect(args.db)
         try:
             sources = {"pi": args.pi_dir, "claude": args.claude_dir}
@@ -735,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             conn.close()
     except (OSError, sqlite3.Error, ValueError) as exc:
-        print(f"agent-sessions: {exc}", file=sys.stderr)
+        print(f"hop: {exc}", file=sys.stderr)
         return 1
     return 0
 

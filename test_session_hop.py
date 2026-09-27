@@ -8,8 +8,8 @@ from unittest.mock import patch
 import re
 import sqlite3
 
-import session_index
-from session_index import (Picker, cells, connect, luminance, launch, main, parse_session, prompt_text, resolve, search,
+import session_hop
+from session_hop import (Picker, cells, connect, luminance, launch, main, parse_session, prompt_text, resolve, search,
                            split_keys, sync, with_default_command)
 
 
@@ -121,7 +121,7 @@ class SessionIndexTests(unittest.TestCase):
     def cli(self, *args):
         options = ["--db", str(self.root / "cli.sqlite3"), "--pi-dir", str(self.pi),
                    "--claude-dir", str(self.claude)]
-        with patch("builtins.print") as printed, patch.object(session_index, "interactive", return_value=False):
+        with patch("builtins.print") as printed, patch.object(session_hop, "interactive", return_value=False):
             code = main(options + list(args))
         return code, "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
 
@@ -290,6 +290,18 @@ class SessionIndexTests(unittest.TestCase):
         self.assertLess(luminance(b"\x1b]11;rgb:0b0b/0e0e/1414\x1b\\"), 0.1)
         self.assertLess(luminance(b"\x1b]11;rgb:1f/24/30\x07"), 0.2)
         self.assertIsNone(luminance(b"\x1b[?62;22c"))
+
+    def test_legacy_index_moves_once_to_the_new_name(self):
+        legacy, current = self.root / "share" / "agent-sessions", self.root / "share" / "session-hop"
+        legacy.mkdir(parents=True)
+        (legacy / "index.sqlite3").write_text("old")
+        with patch.object(session_hop, "LEGACY_DATA_DIR", legacy), patch.object(session_hop, "DATA_DIR", current):
+            session_hop.migrate_legacy_data()
+            self.assertEqual((current / "index.sqlite3").read_text(), "old")
+            legacy.mkdir()  # A leftover old folder never overwrites the current index.
+            session_hop.migrate_legacy_data()
+            self.assertTrue(legacy.exists())
+            self.assertEqual((current / "index.sqlite3").read_text(), "old")
 
 
 if __name__ == "__main__":
