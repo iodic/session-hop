@@ -9,8 +9,8 @@ import curses
 import sqlite3
 
 import session_index
-from session_index import (Picker, connect, launch, main, parse_session, resolve, search, sync,
-                           with_default_command)
+from session_index import (Picker, connect, launch, main, parse_session, prompt_text, resolve, search,
+                           sync, with_default_command)
 
 
 class SessionIndexTests(unittest.TestCase):
@@ -202,6 +202,53 @@ class SessionIndexTests(unittest.TestCase):
         picker.handle("\x15")
         self.assertEqual(len(picker.visible), 3)
         self.assertEqual(picker.handle("\x1b"), "quit")
+
+
+    def test_prompt_text_strips_agent_wrappers(self):
+        skill = '<skill name="fizzy" location="/x/SKILL.md">\n' + "Long skill body. " * 50 + "\n</skill>\n\ncheck card 5902"
+        self.assertEqual(prompt_text(skill).split(), ["/fizzy", "check", "card", "5902"])
+        self.assertEqual(prompt_text("<command-name>/clear</command-name> <command-message>clear</command-message>"
+                                     " <command-args></command-args>"), "")
+        self.assertEqual(prompt_text("<command-message>fizzy</command-message> <command-name>/fizzy</command-name>"
+                                     " <command-args>estimate card 5973</command-args>"), "/fizzy estimate card 5973")
+        for noise in ("<local-command-stdout>Set model</local-command-stdout>", "[Request interrupted by user]",
+                      "<task-notification><summary>done</summary></task-notification>",
+                      "<bash-input> ls</bash-input>", "[Extension issues]\n  router.ts failed"):
+            self.assertEqual(prompt_text(noise).strip(), "")
+        self.assertEqual(prompt_text("[Image #1]can you read this").strip(), "can you read this")
+
+    def test_bare_command_skipped_for_title_and_old_rows_reparsed(self):
+        self.write_lines(self.claude / "p" / "cleared.jsonl", [
+            {"type": "user", "sessionId": "cleared", "cwd": str(self.project),
+             "message": {"content": "<command-name>/clear</command-name><command-args></command-args>"}},
+            {"type": "user", "sessionId": "cleared", "cwd": str(self.project), "message": {"content": "Real request"}},
+        ])
+        sync(self.db, self.sources)
+        self.assertEqual(resolve(self.db, "cleared")["title"], "Real request")
+        self.db.execute("UPDATE sessions SET title='<command-name>/clear', note='mine', bookmarked=1")
+        self.db.execute("PRAGMA user_version=0")
+        self.db.commit()
+        conn = connect(self.root / "private" / "index.sqlite3")
+        self.addCleanup(conn.close)
+        self.assertEqual(sync(conn, self.sources), (1, 0))
+        row = resolve(conn, "cleared")
+        self.assertEqual((row["title"], row["note"], row["bookmarked"]), ("Real request", "mine", 1))
+
+    def test_bare_command_title_only_when_answered_and_empty_sessions_dropped(self):
+        bare = {"type": "user", "cwd": str(self.project),
+                "message": {"content": "<command-name>/qa</command-name><command-args></command-args>"}}
+        self.write_lines(self.claude / "p" / "qa.jsonl", [
+            {**bare, "sessionId": "qa"}, {"type": "assistant", "sessionId": "qa", "cwd": str(self.project)}])
+        empty = self.write_lines(self.claude / "p" / "empty.jsonl", [{**bare, "sessionId": "empty"}])
+        kept = self.write_lines(self.claude / "p" / "kept.jsonl", [{**bare, "sessionId": "kept"}])
+        for path, sid in ((empty, "empty"), (kept, "kept")):  # Rows left behind by an older parser.
+            self.db.execute("INSERT INTO sessions(agent, sid, cwd, title, description, source_path, mtime_ns, size,"
+                            " updated) VALUES ('claude', ?, ?, 'junk', '', ?, 0, 0, 0)", (sid, str(self.project), str(path)))
+        self.db.execute("UPDATE sessions SET bookmarked=1 WHERE sid='kept'")
+        self.db.commit()
+        self.assertEqual(sync(self.db, self.sources), (1, 1))
+        self.assertEqual(resolve(self.db, "qa")["title"], "/qa")
+        self.assertEqual(sorted(r["sid"] for r in search(self.db)), ["kept", "qa"])
 
 
 if __name__ == "__main__":

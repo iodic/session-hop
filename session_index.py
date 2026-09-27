@@ -16,6 +16,7 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) /
 DEFAULT_DB = DATA_DIR / "index.sqlite3"
 DEFAULT_PI = Path.home() / ".pi/agent/sessions"
 DEFAULT_CLAUDE = Path.home() / ".claude/projects"
+PARSER_VERSION = 1  # Bump when parse_session output changes to re-read unchanged files.
 
 
 def clean(text: str, limit: int) -> str:
@@ -23,13 +24,34 @@ def clean(text: str, limit: int) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
-def user_text(content: object) -> str:
+SKILL_BLOCK = re.compile(r'<skill name="([^"]*)"[^>]*>.*?</skill>', re.S)
+COMMAND_NAME = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+# Harness output echoed into user turns: command output, shell escapes, notifications, markers.
+HARNESS_NOISE = re.compile(
+    r"<(local-command-[\w-]+|bash-[\w-]+|task-notification|system-reminder)>.*?</\1>"
+    r"|<!--.*?-->|\[Image #\d+\]|\[Request interrupted by user[^\]]*\]|\[Extension issues\].*", re.S)
+
+
+def prompt_text(text: str) -> str:
+    """What the person actually typed, without the wrappers agents put around it."""
+    command = COMMAND_NAME.search(text)
+    if command:
+        # A bare "/clear" or "/model" says nothing about the conversation; keep only commands with arguments.
+        args = COMMAND_ARGS.search(text)
+        args = args[1].strip() if args else ""
+        return f"{command[1].strip()} {args}" if args else ""
+    text = SKILL_BLOCK.sub(lambda match: f"/{match[1]} ", text)
+    return HARNESS_NOISE.sub(" ", text)
+
+
+def raw_text(content: object) -> str:
     if isinstance(content, str):
-        return clean(content, 280)
+        return content
     if isinstance(content, list):
-        return clean(" ".join(block.get("text", "") for block in content
-                              if isinstance(block, dict) and block.get("type") == "text"
-                              and isinstance(block.get("text"), str)), 280)
+        return "\n".join(block.get("text", "") for block in content
+                         if isinstance(block, dict) and block.get("type") == "text"
+                         and isinstance(block.get("text"), str))
     return ""
 
 
@@ -40,6 +62,20 @@ def parse_session(agent: str, path: Path) -> dict | None:
     last = ""
     name = ""
     ai_title = ""
+    command = ""  # A bare "/qa" is the title of last resort, if the agent went on to answer it.
+    replied = False
+
+    def take(content: object) -> None:
+        nonlocal first, last, command
+        raw = raw_text(content)
+        # Wrappers go before truncation so a long skill block can't crowd out the request after it.
+        text = clean(prompt_text(raw), 280)
+        if text:
+            first = first or text
+            last = text
+        elif not command and (match := COMMAND_NAME.search(raw)):
+            command = clean(match[1], 100)
+
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
             try:
@@ -58,10 +94,9 @@ def parse_session(agent: str, path: Path) -> dict | None:
                 elif kind == "message":
                     message = entry.get("message")
                     if isinstance(message, dict) and message.get("role") == "user":
-                        text = user_text(message.get("content"))
-                        if text:
-                            first = first or text
-                            last = text
+                        take(message.get("content"))
+                    elif isinstance(message, dict) and message.get("role") == "assistant":
+                        replied = True
             else:
                 if kind in ("user", "assistant", "ai-title", "custom-title", "agent-name"):
                     sid = entry.get("sessionId") or sid
@@ -73,10 +108,11 @@ def parse_session(agent: str, path: Path) -> dict | None:
                 elif kind == "user" and not entry.get("isSidechain") and not entry.get("isMeta"):
                     message = entry.get("message")
                     if isinstance(message, dict):
-                        text = user_text(message.get("content"))
-                        if text:
-                            first = first or text
-                            last = text
+                        take(message.get("content"))
+                elif kind == "assistant" and not entry.get("isSidechain"):
+                    replied = True
+    first = first or (command if replied else "")
+    last = last or first
     if agent == "claude":
         sid = sid or path.stem
     if not isinstance(sid, str) or not isinstance(cwd, str) or not cwd or not (first or name or ai_title):
@@ -114,6 +150,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE sessions ADD COLUMN project TEXT")
     if "bookmarked" not in columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN bookmarked INTEGER NOT NULL DEFAULT 0")
+    # When parsing improves, forget file stamps so the next scan re-reads every session.
+    # Manual titles, notes, tags, and bookmarks are untouched.
+    if conn.execute("PRAGMA user_version").fetchone()[0] < PARSER_VERSION:
+        conn.execute("UPDATE sessions SET mtime_ns=0")
+        conn.execute(f"PRAGMA user_version={PARSER_VERSION}")
+        conn.commit()
     return conn
 
 
@@ -150,6 +192,10 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path]) -> tuple[int, int]:
                     continue
                 info = parse_session(agent, path)
                 if not info:
+                    # Nothing worth resuming, such as a lone "/clear". Drop a stale entry unless annotated.
+                    removed += conn.execute(
+                        "DELETE FROM sessions WHERE agent=? AND source_path=? AND custom_title IS NULL "
+                        "AND note IS NULL AND tags='' AND bookmarked=0", (agent, str(path))).rowcount
                     continue
                 if info["cwd"] not in roots:
                     roots[info["cwd"]] = project_root(info["cwd"])
@@ -262,15 +308,91 @@ def interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def age(timestamp: float, now: float) -> str:
+    seconds = max(0, now - timestamp)
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    if seconds < 7 * 86400:
+        return f"{int(seconds // 86400)}d"
+    return datetime.fromtimestamp(timestamp).strftime("%b %d" if seconds < 300 * 86400 else "%Y")
+
+
+def fit(text: str, width: int) -> str:
+    return text[:width - 1] + "…" if len(text) > width else text.ljust(width)
+
+
+def highlight(text: str, terms: list[str], attr: int, hit: int) -> list[tuple[str, int]]:
+    # Split text into segments so every occurrence of a search word stands out.
+    marked = [False] * len(text)
+    folded = text.lower()
+    for term in terms:
+        start = folded.find(term)
+        while term and start != -1:
+            marked[start:start + len(term)] = [True] * len(term)
+            start = folded.find(term, start + len(term))
+    segments: list[tuple[str, int]] = []
+    for char, on in zip(text, marked):
+        style = hit if on else attr
+        if segments and segments[-1][1] == style:
+            segments[-1] = (segments[-1][0] + char, style)
+        else:
+            segments.append((char, style))
+    return segments
+
+
+def theme() -> dict[str, int]:
+    # Only the terminal's own palette slots and default background are used,
+    # so the picker follows whatever color scheme the terminal has.
+    # "sel_*" variants draw the selected row on a full-width band.
+    import curses
+    italic = getattr(curses, "A_ITALIC", 0)
+    style = {"accent": curses.A_BOLD, "star": curses.A_BOLD, "project": 0, "hit": curses.A_UNDERLINE | curses.A_BOLD, "dim": curses.A_DIM, "note": italic,
+             "plain": 0}
+    names = ("accent", "star", "project", "hit", "dim", "plain")
+    if not curses.has_colors():
+        style.update({f"sel_{name}": style[name] | curses.A_REVERSE for name in names})
+        return style
+    try:
+        curses.use_default_colors()
+        background = -1
+    except curses.error:
+        background = curses.COLOR_BLACK
+    # Yellow is the accent: most themes (Ayu included) put their signature warm tone there.
+    palette = (("accent", curses.COLOR_YELLOW, curses.A_BOLD),
+               ("star", curses.COLOR_YELLOW, curses.A_BOLD),
+               ("project", curses.COLOR_BLUE, 0),
+               ("hit", curses.COLOR_YELLOW, curses.A_BOLD | curses.A_UNDERLINE))
+    for number, (name, color, extra) in enumerate(palette, 1):
+        curses.init_pair(number, color, background)
+        style[name] = curses.color_pair(number) | extra
+    if curses.COLORS >= 16:
+        # Bright black (palette slot 8) is the theme's own muted gray for selections.
+        band = 8
+        for number, (name, color, extra) in enumerate(palette, len(palette) + 1):
+            curses.init_pair(number, color, band)
+            style[f"sel_{name}"] = curses.color_pair(number) | extra
+        curses.init_pair(2 * len(palette) + 1, -1 if background == -1 else curses.COLOR_WHITE, band)
+        style["sel_plain"] = style["sel_dim"] = curses.color_pair(2 * len(palette) + 1)
+    else:
+        style.update({f"sel_{name}": curses.A_REVERSE for name in names})
+    return style
+
+
 class Picker:
     """Filter-as-you-type session list. Kept free of curses calls except in draw() for testing."""
 
-    HELP = "↑↓ move  enter open  tab bookmark  esc quit"
+    KEYS = (("↑↓", "move"), ("⏎", "open"), ("tab", "bookmark"), ("esc", "quit"))
 
-    def __init__(self, rows: list[dict], query: str = "", on_bookmark=None):
+    def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = ""):
         self.rows = rows
         self.query = query
         self.on_bookmark = on_bookmark
+        self.scope = scope
+        self.style: dict[str, int] | None = None
         self.index = 0
         self.top = 0
         self.page = 10
@@ -318,46 +440,80 @@ class Picker:
             self.refilter()
         return None
 
+    def row_segments(self, row: dict, chosen: bool, now: float) -> list[tuple[str, int]]:
+        import curses
+        prefix = "sel_" if chosen else ""
+        s = {name: self.style[prefix + name] for name in ("accent", "star", "project", "hit", "dim", "plain")}
+        title_attr = s["plain"] | (curses.A_BOLD if chosen else 0)
+        project = Path(row["project"] or row["cwd"]).name or row["cwd"]
+        return [
+            ("▌ " if chosen else "  ", s["accent"]),
+            ("★ " if row["bookmarked"] else "  ", s["star"]),
+            (f"{row['agent']:<7}", s["dim"]),
+            (f"{age(row['updated'], now):>6}  ", s["dim"]),
+            (fit(project, 18) + "  ", s["project"]),
+            *highlight(row["display_title"], self.query.lower().split(), title_attr,
+                       s["hit"] | (title_attr & curses.A_BOLD)),
+        ]
+
     def draw(self, screen) -> None:
         import curses
+        if self.style is None:
+            self.style = theme()
+        s = self.style
         screen.erase()
         height, width = screen.getmaxyx()
 
-        def put(y: int, x: int, text: str, attr: int = 0) -> None:
-            if 0 <= y < height and x < width - 1:
+        def put(y: int, x: int, segments: list[tuple[str, int]]) -> int:
+            for text, attr in segments:
+                room = width - x - 1
+                if not 0 <= y < height or room <= 0:
+                    break
                 try:
-                    screen.addnstr(y, x, text, width - x - 1, attr)
+                    screen.addnstr(y, x, text, room, attr)
                 except curses.error:
                     pass  # Wide characters can overrun the last column.
+                x += len(text)
+            return x
 
+        now = datetime.now().timestamp()
         self.page = max(1, height - 5)
         if self.index < self.top:
             self.top = self.index
         elif self.index >= self.top + self.page:
             self.top = self.index - self.page + 1
-        count = f"{len(self.visible)}/{len(self.rows)}"
-        put(0, max(0, width - len(count) - 1), count, curses.A_DIM)
         for line, row in enumerate(self.visible[self.top:self.top + self.page], 1):
             chosen = self.top + line - 1 == self.index
-            put(line, 0, ("▸" if chosen else " ") + format_row(row), curses.A_REVERSE if chosen else 0)
+            if chosen:
+                put(line, 0, [(" " * width, s["sel_plain"])])
+            put(line, 0, self.row_segments(row, chosen, now))
         if not self.visible:
-            put(1, 2, "No matching sessions.", curses.A_DIM)
+            put(2, 4, [("No matching sessions", s["dim"] | s["note"])])
+        put(height - 4, 0, [("─" * (width - 1), s["dim"])])
         row = self.selected
         if row:
-            put(height - 3, 2, row["cwd"], curses.A_DIM)
-            put(height - 2, 2, row["display_note"])
-        put(height - 1, 2, self.HELP, curses.A_DIM)
-        put(0, 0, f"> {self.query}", curses.A_BOLD)
+            put(height - 3, 2, [(f"{row['agent']}:{row['sid'][:8]}", s["accent"]),
+                                ("  " + row["cwd"].replace(str(Path.home()), "~", 1), s["dim"])])
+            put(height - 2, 2, [(row["display_note"], s["note"])])
+        footer = []
+        for key, label in self.KEYS:
+            footer += [(key, s["accent"]), (f" {label}   ", s["dim"])]
+        put(height - 1, 2, footer)
+        count = f"{len(self.visible)}/{len(self.rows)}"
+        right = [(self.scope + "  ", s["project"])] if self.scope else []
+        right.append((count, s["dim"]))
+        put(0, max(0, width - 1 - sum(len(t) for t, _ in right)), right)
+        cursor = put(0, 1, [("❯ ", s["accent"]), (self.query, curses.A_BOLD)])
         try:
-            screen.move(0, min(width - 1, 2 + len(self.query)))
+            screen.move(0, min(width - 1, cursor))
         except curses.error:
             pass
 
 
-def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "") -> dict | None:
+def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: str = "") -> dict | None:
     import curses
     os.environ.setdefault("ESCDELAY", "25")  # Esc should quit without the default one-second pause.
-    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value))
+    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope)
 
     def run(screen):
         screen.keypad(True)
@@ -461,7 +617,9 @@ def main(argv: list[str] | None = None) -> int:
                     rows = search(conn, "", args.limit, project=args.project, bookmarked=args.bookmarked)
                     if not rows:
                         print("No sessions found.")
-                    elif selected := picker(conn, rows, query):
+                    elif selected := picker(conn, rows, query, " · ".join(
+                            filter(None, [args.project and f"project {args.project}",
+                                          args.bookmarked and "★ bookmarked"]))):
                         launch(selected)
             elif args.command == "open":
                 sync(conn, sources)
