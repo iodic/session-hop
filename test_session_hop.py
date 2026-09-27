@@ -122,12 +122,17 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(search(self.db, "ignore me"), [])
 
 
-    def cli(self, *args):
+    def cli(self, *args, terminal=True):
+        """Run the CLI; returns the exit code, printed text, and the sessions and query handed to the picker."""
         options = ["--db", str(self.root / "cli.sqlite3"), "--pi-dir", str(self.pi),
                    "--claude-dir", str(self.claude), "--codex-dir", str(self.codex)]
-        with patch("builtins.print") as printed, patch.object(session_hop, "interactive", return_value=False):
+        with patch("builtins.print") as printed, patch("sys.stderr"), \
+                patch.object(session_hop, "interactive", return_value=terminal), \
+                patch.object(session_hop, "picker", return_value=None) as shown:
             code = main(options + list(args))
-        return code, "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
+        out = "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
+        rows, query = shown.call_args.args[1:3] if shown.called else ([], None)
+        return code, out, Picker(rows, query or "").visible
 
     def pi_session(self, sid, cwd, text):
         self.write_lines(self.pi / f"2026_{sid}.jsonl", [
@@ -143,10 +148,10 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(with_default_command(["--", "sync"]), ["pick", "--", "sync"])
         self.pi_session("one", self.project, "Billbee invoices")
         self.pi_session("two", self.project, "Unrelated work")
-        code, out = self.cli("billbee")
+        code, _, shown = self.cli("billbee")
         self.assertEqual(code, 0)
-        self.assertIn("Billbee invoices", out)
-        self.assertNotIn("Unrelated", out)
+        self.assertEqual([row["display_title"] for row in shown], ["Billbee invoices"])
+        self.assertEqual(self.cli("billbee", terminal=False)[0], 1)  # No list output without a terminal.
 
     def test_project_root_recorded_and_filterable(self):
         repo = self.root / "billbee-api"
@@ -180,10 +185,8 @@ class SessionIndexTests(unittest.TestCase):
         self.pi_session("01a0da86", self.project, "Half-done migration")
         self.pi_session("99ffee00", self.project, "Finished work")
         self.assertEqual(self.cli("bm", "01a0", "needs", "tests")[0], 0)
-        code, out = self.cli("-b")
-        self.assertIn("★ pi:01a0da86", out)
-        self.assertIn("needs tests", out)
-        self.assertNotIn("Finished", out)
+        shown = self.cli("-b")[2]
+        self.assertEqual([(row["sid"], row["display_note"]) for row in shown], [("01a0da86", "needs tests")])
         self.assertEqual(self.cli("unbookmark", "01a0")[0], 0)
         self.assertIn("No sessions found.", self.cli("-b")[1])
 

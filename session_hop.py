@@ -432,21 +432,6 @@ def resume_argv(row: sqlite3.Row) -> list[str]:
     return ["claude", "--resume", row["sid"]]
 
 
-def format_row(row) -> str:
-    date = datetime.fromtimestamp(row["updated"]).strftime("%Y-%m-%d")
-    project = Path(row["project"] or row["cwd"]).name or row["cwd"]
-    mark = "★" if row["bookmarked"] else " "
-    return f"{mark} {row['agent'] + ':' + row['sid'][:8]:<15}  {date}  {project[:20]:<20}  {row['display_title']}"
-
-
-def print_rows(rows: list[dict]) -> None:
-    for row in rows:
-        print(format_row(row))
-        print(f"     {row['display_note']}")
-    if not rows:
-        print("No sessions found.")
-
-
 def interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
@@ -771,7 +756,7 @@ def launch(row: sqlite3.Row, dry_run: bool = False) -> None:
     os.execvp(argv[0], argv)
 
 
-COMMANDS = {"sync", "find", "pick", "open", "rename", "title", "note", "tag", "bookmark", "bm", "unbookmark", "unbm"}
+COMMANDS = {"sync", "pick", "open", "rename", "title", "note", "tag", "bookmark", "bm", "unbookmark", "unbm"}
 GLOBAL_OPTIONS = {"--db", "--pi-dir", "--claude-dir", "--codex-dir"}
 
 
@@ -803,13 +788,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--codex-dir", type=Path, default=DEFAULT_CODEX, help="Codex sessions directory")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("sync", help="Index new and changed sessions")
-    for verb, help_text, limit in (("pick", "Choose a session and resume it (default)", None),
-                                   ("find", "Print matching sessions, newest first", 30)):
-        cmd = sub.add_parser(verb, help=help_text)
-        cmd.add_argument("query", nargs="*", help="Words in title, note, path, tags, or ID")
-        cmd.add_argument("-p", "--project", help="Project name, or a path such as '.' for the current checkout")
-        cmd.add_argument("-b", "--bookmarked", action="store_true", help="Only bookmarked sessions")
-        cmd.add_argument("--limit", type=int, default=limit)
+    pick = sub.add_parser("pick", help="Choose a session and resume it (default)")
+    pick.add_argument("query", nargs="*", help="Words in title, note, path, tags, or ID")
+    pick.add_argument("-p", "--project", help="Project name, or a path such as '.' for the current checkout")
+    pick.add_argument("-b", "--bookmarked", action="store_true", help="Only bookmarked sessions")
+    pick.add_argument("--limit", type=int, help="Show at most this many of the newest sessions")
     opening = sub.add_parser("open", help="Resume a session by ID prefix")
     opening.add_argument("id")
     opening.add_argument("--dry-run", action="store_true", help="Print the shell command instead")
@@ -825,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
     unmark = sub.add_parser("unbookmark", aliases=["unbm"], help="Remove a bookmark")
     unmark.add_argument("id")
     args = parser.parse_args(with_default_command(sys.argv[1:] if argv is None else list(argv)))
-    if args.command in ("find", "pick") and args.limit is not None and args.limit < 1:
+    if args.command == "pick" and args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
     try:
         if args.db == DEFAULT_DB:
@@ -836,21 +819,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "sync":
                 updated, removed = scan(conn, sources)
                 print(f"Indexed {updated} changed sessions; removed {removed} missing sessions. {conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]} total.")
-            elif args.command in ("find", "pick"):
+            elif args.command == "pick":
+                if not interactive():
+                    raise ValueError("the picker needs a terminal; use 'hop open <id>' to resume by ID.")
                 scan(conn, sources)
-                query = " ".join(args.query)
-                if args.command == "find" or not interactive():
-                    print_rows(search(conn, query, args.limit or 30, project=args.project,
-                                      bookmarked=args.bookmarked))
-                else:
-                    # The picker filters as you type, so it starts from every candidate.
-                    rows = search(conn, "", args.limit, project=args.project, bookmarked=args.bookmarked)
-                    if not rows:
-                        print("No sessions found.")
-                    elif selected := picker(conn, rows, query, " · ".join(
-                            filter(None, [args.project and f"project {args.project}",
-                                          args.bookmarked and "★ bookmarked"]))):
-                        launch(selected)
+                # The picker filters as you type, so it starts from every candidate.
+                rows = search(conn, "", args.limit, project=args.project, bookmarked=args.bookmarked)
+                if not rows:
+                    print("No sessions found.")
+                elif selected := picker(conn, rows, " ".join(args.query), " · ".join(
+                        filter(None, [args.project and f"project {args.project}",
+                                      args.bookmarked and "★ bookmarked"]))):
+                    launch(selected)
             elif args.command == "open":
                 scan(conn, sources)
                 launch(resolve(conn, args.id), args.dry_run)
