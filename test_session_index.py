@@ -5,12 +5,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import curses
+import re
 import sqlite3
 
 import session_index
-from session_index import (Picker, connect, launch, main, parse_session, prompt_text, resolve, search,
-                           sync, with_default_command)
+from session_index import (Picker, cells, connect, launch, main, parse_session, prompt_text, resolve, search,
+                           split_keys, sync, with_default_command)
 
 
 class SessionIndexTests(unittest.TestCase):
@@ -190,18 +190,18 @@ class SessionIndexTests(unittest.TestCase):
         toggled = []
         picker = Picker(rows, "billbee", lambda row, value: toggled.append((row["sid"], value)))
         self.assertEqual([r["sid"] for r in picker.visible], ["a", "b"])
-        picker.handle(curses.KEY_DOWN)
-        picker.handle(curses.KEY_DOWN)
+        picker.handle("down")
+        picker.handle("down")
         self.assertEqual(picker.selected["sid"], "b")
-        picker.handle("\t")
+        picker.handle("tab")
         self.assertEqual(toggled, [("b", True)])
         for key in " stock":
             picker.handle(key)
         self.assertEqual([r["sid"] for r in picker.visible], ["b"])
-        self.assertEqual(picker.handle("\n"), "open")
-        picker.handle("\x15")
+        self.assertEqual(picker.handle("enter"), "open")
+        picker.handle("clear")
         self.assertEqual(len(picker.visible), 3)
-        self.assertEqual(picker.handle("\x1b"), "quit")
+        self.assertEqual(picker.handle("esc"), "quit")
 
 
     def test_prompt_text_strips_agent_wrappers(self):
@@ -249,6 +249,30 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(sync(self.db, self.sources), (1, 1))
         self.assertEqual(resolve(self.db, "qa")["title"], "/qa")
         self.assertEqual(sorted(r["sid"] for r in search(self.db)), ["kept", "qa"])
+
+    def test_split_keys_handles_sequences_batches_and_text(self):
+        self.assertEqual(split_keys("\x1b[B\x1b[Bab\r"), ["down", "down", "a", "b", "enter"])
+        self.assertEqual(split_keys("\x1bOA\x1b"), ["up", "esc"])
+        self.assertEqual(split_keys("\x1b[1;5C\x01ž"), ["ž"])  # Unknown keys are ignored.
+
+    def test_render_fits_height_and_width_with_theme_palette_only(self):
+        rows = [{"agent": "claude", "sid": f"id{i}", "cwd": "/p", "project": "/p", "display_title": f"Task {i} 日本語",
+                 "display_note": "note", "tags": "", "bookmarked": i == 0, "updated": 0} for i in range(20)]
+        picker = Picker(rows, "task", scope="project p")
+        for _ in range(12):
+            picker.handle("down")
+        lines, column = picker.render(60, 8)
+        self.assertEqual(len(lines), 8)
+        plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
+        self.assertTrue(all(cells(line) <= 59 for line in plain))
+        self.assertTrue(plain[0].startswith("❯ task") and plain[0].endswith("project p  20/20"))
+        self.assertEqual(sum("▌" in line for line in plain), 1)
+        self.assertIn("Task 12", "".join(plain))
+        self.assertEqual(column, cells("❯ task"))
+        codes = {code for line in lines for group in re.findall(r"\x1b\[([0-9;]*)m", line) for code in group.split(";")}
+        self.assertTrue(codes <= {"", "0", "1", "2", "3", "4", "33", "34", "100"}, codes)
+        no_color = Picker(rows, "task", color=False).render(60, 8)[0]
+        self.assertNotRegex("".join(no_color), r"\x1b\[[0-9;]*(3\d|100)")
 
 
 if __name__ == "__main__":

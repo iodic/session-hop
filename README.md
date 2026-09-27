@@ -19,7 +19,7 @@ Search and resume local Pi and Claude Code conversations across projects. Python
 ./agent-sessions sync
 ```
 
-Words without a command open the picker (`pick` is the explicit name). It filters as you type: ↑/↓ or Ctrl-P/Ctrl-N move, PgUp/PgDn page, Backspace and Ctrl-U edit the query, Tab toggles a bookmark, Enter resumes, Esc quits. When stdin or stdout isn't a terminal, it prints the list instead. To search for a word that is also a command name, use `agent-sessions -- sync` or `find sync`.
+Words without a command open the picker (`pick` is the explicit name). Like `fzf --height`, it draws below the prompt instead of taking over the screen, and erases itself on exit. It filters as you type: ↑/↓ or Ctrl-P/Ctrl-N move, PgUp/PgDn page, Backspace, Ctrl-W, and Ctrl-U edit the query, Tab toggles a bookmark, Enter resumes, Esc or Ctrl-C quits. Colors are the terminal's own palette slots, so they follow its theme; set `NO_COLOR` to turn them off. When stdin or stdout isn't a terminal, it prints the list instead. To search for a word that is also a command name, use `agent-sessions -- sync` or `find sync`.
 
 Each scan records a session's project: the nearest Git checkout containing its working directory, or the directory itself (your home directory never counts as a checkout). `-p` accepts a path (`.`, `~/work/app`) to show sessions under that checkout, or a bare word matched against project names. `-p` and `-b` work with `pick` and `find`, and search words also match project paths. Bookmarks (★) mark sessions to come back to; `bookmark`/`unbookmark` are the long forms of `bm`/`unbm`.
 

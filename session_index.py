@@ -7,9 +7,13 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import sqlite3
 import sys
+import termios
+import tty
+import unicodedata
 from datetime import datetime
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "agent-sessions"
@@ -321,11 +325,26 @@ def age(timestamp: float, now: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%b %d" if seconds < 300 * 86400 else "%Y")
 
 
+def cells(text: str) -> int:
+    # Terminal columns: wide East Asian characters and most emoji take two.
+    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1
+               for char in text)
+
+
+def clip(text: str, room: int) -> str:
+    used = 0
+    for i, char in enumerate(text):
+        used += cells(char)
+        if used > room:
+            return text[:i]
+    return text
+
+
 def fit(text: str, width: int) -> str:
     return text[:width - 1] + "…" if len(text) > width else text.ljust(width)
 
 
-def highlight(text: str, terms: list[str], attr: int, hit: int) -> list[tuple[str, int]]:
+def highlight(text: str, terms: list[str], style: str, hit: str) -> list[tuple[str, str]]:
     # Split text into segments so every occurrence of a search word stands out.
     marked = [False] * len(text)
     folded = text.lower()
@@ -334,65 +353,76 @@ def highlight(text: str, terms: list[str], attr: int, hit: int) -> list[tuple[st
         while term and start != -1:
             marked[start:start + len(term)] = [True] * len(term)
             start = folded.find(term, start + len(term))
-    segments: list[tuple[str, int]] = []
+    segments: list[tuple[str, str]] = []
     for char, on in zip(text, marked):
-        style = hit if on else attr
-        if segments and segments[-1][1] == style:
-            segments[-1] = (segments[-1][0] + char, style)
+        current = hit if on else style
+        if segments and segments[-1][1] == current:
+            segments[-1] = (segments[-1][0] + char, current)
         else:
-            segments.append((char, style))
+            segments.append((char, current))
     return segments
 
 
-def theme() -> dict[str, int]:
-    # Only the terminal's own palette slots and default background are used,
-    # so the picker follows whatever color scheme the terminal has.
-    # "sel_*" variants draw the selected row on a full-width band.
-    import curses
-    italic = getattr(curses, "A_ITALIC", 0)
-    style = {"accent": curses.A_BOLD, "star": curses.A_BOLD, "project": 0, "hit": curses.A_UNDERLINE | curses.A_BOLD, "dim": curses.A_DIM, "note": italic,
-             "plain": 0}
-    names = ("accent", "star", "project", "hit", "dim", "plain")
-    if not curses.has_colors():
-        style.update({f"sel_{name}": style[name] | curses.A_REVERSE for name in names})
-        return style
-    try:
-        curses.use_default_colors()
-        background = -1
-    except curses.error:
-        background = curses.COLOR_BLACK
-    # Yellow is the accent: most themes (Ayu included) put their signature warm tone there.
-    palette = (("accent", curses.COLOR_YELLOW, curses.A_BOLD),
-               ("star", curses.COLOR_YELLOW, curses.A_BOLD),
-               ("project", curses.COLOR_BLUE, 0),
-               ("hit", curses.COLOR_YELLOW, curses.A_BOLD | curses.A_UNDERLINE))
-    for number, (name, color, extra) in enumerate(palette, 1):
-        curses.init_pair(number, color, background)
-        style[name] = curses.color_pair(number) | extra
-    if curses.COLORS >= 16:
-        # Bright black (palette slot 8) is the theme's own muted gray for selections.
-        band = 8
-        for number, (name, color, extra) in enumerate(palette, len(palette) + 1):
-            curses.init_pair(number, color, band)
-            style[f"sel_{name}"] = curses.color_pair(number) | extra
-        curses.init_pair(2 * len(palette) + 1, -1 if background == -1 else curses.COLOR_WHITE, band)
-        style["sel_plain"] = style["sel_dim"] = curses.color_pair(2 * len(palette) + 1)
-    else:
-        style.update({f"sel_{name}": curses.A_REVERSE for name in names})
-    return style
+# Styles are SGR parameters naming the terminal's own palette slots (33 = its yellow,
+# 34 = its blue, 100 = its bright black) rather than RGB values, so the terminal theme
+# decides every actual color. Yellow is the accent: most themes put their signature warm tone there.
+ACCENT, PROJECT, HIT, DIM, NOTE, BOLD = "1;33", "34", "1;4;33", "2", "3", "1"
+BAND = "100"
+COLOR_CODE = re.compile(r"^(3|4|9|10)\d$")
+
+
+def paint(segments: list[tuple[str, str]], width: int, band: bool = False, color: bool = True) -> str:
+    """One screen line: styled segments clipped to width, the selected row padded into a band."""
+    out = []
+    used = 0
+    for text, style in segments:
+        text = clip(text, width - used)
+        if not text:
+            break
+        codes = [code for code in style.split(";") if code
+                 and not (band and code == DIM) and (color or not COLOR_CODE.match(code))]
+        if band:
+            codes.append(BAND if color else "7")
+        out.append(f"\x1b[0;{';'.join(codes)}m{text}" if codes else f"\x1b[0m{text}")
+        used += cells(text)
+    if band and used < width:
+        out.append(f"\x1b[0;{BAND if color else '7'}m" + " " * (width - used))
+    return "".join(out) + "\x1b[0m"
+
+
+KEY_NAMES = {"\x1b[A": "up", "\x1bOA": "up", "\x10": "up", "\x1b[B": "down", "\x1bOB": "down", "\x0e": "down",
+             "\x1b[5~": "pageup", "\x1b[6~": "pagedown", "\r": "enter", "\n": "enter", "\t": "tab",
+             "\x7f": "backspace", "\x08": "backspace", "\x15": "clear", "\x17": "word",
+             "\x1b": "esc", "\x03": "esc", "\x07": "esc"}
+ESCAPE_SEQUENCE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|O.)")
+
+
+def split_keys(data: str) -> list[str]:
+    """Key names or typed text from one read, which can hold several keys or a paste."""
+    keys = []
+    i = 0
+    while i < len(data):
+        sequence = ESCAPE_SEQUENCE.match(data, i)
+        chunk = sequence[0] if sequence else data[i]
+        if chunk in KEY_NAMES:
+            keys.append(KEY_NAMES[chunk])
+        elif chunk.isprintable():
+            keys.append(chunk)
+        i += len(chunk)  # Unknown escape sequences and control characters are ignored.
+    return keys
 
 
 class Picker:
-    """Filter-as-you-type session list. Kept free of curses calls except in draw() for testing."""
+    """Filter-as-you-type session list. Renders to strings so it can be tested without a terminal."""
 
-    KEYS = (("↑↓", "move"), ("⏎", "open"), ("tab", "bookmark"), ("esc", "quit"))
+    HINTS = (("↑↓", "move"), ("⏎", "open"), ("tab", "bookmark"), ("esc", "quit"))
 
-    def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = ""):
+    def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = "", color: bool = True):
         self.rows = rows
         self.query = query
         self.on_bookmark = on_bookmark
         self.scope = scope
-        self.style: dict[str, int] | None = None
+        self.color = color
         self.index = 0
         self.top = 0
         self.page = 10
@@ -411,124 +441,129 @@ class Picker:
         if self.visible:
             self.index = max(0, min(len(self.visible) - 1, self.index + step))
 
-    def handle(self, key) -> str | None:
-        import curses
-        if key in ("\n", "\r", curses.KEY_ENTER):
+    def handle(self, key: str) -> str | None:
+        if key == "enter":
             return "open" if self.visible else None
-        if key == "\x1b":
+        if key == "esc":
             return "quit"
-        if key in (curses.KEY_UP, "\x10"):  # Ctrl-P
-            self.move(-1)
-        elif key in (curses.KEY_DOWN, "\x0e"):  # Ctrl-N
-            self.move(1)
-        elif key == curses.KEY_PPAGE:
-            self.move(-self.page)
-        elif key == curses.KEY_NPAGE:
-            self.move(self.page)
-        elif key == "\t":
+        if key in ("up", "down", "pageup", "pagedown"):
+            self.move({"up": -1, "down": 1, "pageup": -self.page, "pagedown": self.page}[key])
+        elif key == "tab":
             row = self.selected
             if row and self.on_bookmark:
                 self.on_bookmark(row, not row["bookmarked"])
-        elif key in (curses.KEY_BACKSPACE, "\x7f", "\x08"):
+        elif key == "backspace":
             self.query = self.query[:-1]
             self.refilter()
-        elif key == "\x15":  # Ctrl-U
+        elif key == "clear":
             self.query = ""
             self.refilter()
-        elif isinstance(key, str) and key.isprintable():
+        elif key == "word":
+            self.query = re.sub(r"\S*\s*$", "", self.query)
+            self.refilter()
+        elif len(key) == 1:
             self.query += key
             self.refilter()
         return None
 
-    def row_segments(self, row: dict, chosen: bool, now: float) -> list[tuple[str, int]]:
-        import curses
-        prefix = "sel_" if chosen else ""
-        s = {name: self.style[prefix + name] for name in ("accent", "star", "project", "hit", "dim", "plain")}
-        title_attr = s["plain"] | (curses.A_BOLD if chosen else 0)
+    def row_segments(self, row: dict, chosen: bool, now: float) -> list[tuple[str, str]]:
         project = Path(row["project"] or row["cwd"]).name or row["cwd"]
+        title = BOLD if chosen else ""
         return [
-            ("▌ " if chosen else "  ", s["accent"]),
-            ("★ " if row["bookmarked"] else "  ", s["star"]),
-            (f"{row['agent']:<7}", s["dim"]),
-            (f"{age(row['updated'], now):>6}  ", s["dim"]),
-            (fit(project, 18) + "  ", s["project"]),
-            *highlight(row["display_title"], self.query.lower().split(), title_attr,
-                       s["hit"] | (title_attr & curses.A_BOLD)),
+            ("▌ " if chosen else "  ", ACCENT),
+            ("★ " if row["bookmarked"] else "  ", ACCENT),
+            (f"{row['agent']:<7}", DIM),
+            (f"{age(row['updated'], now):>6}  ", DIM),
+            (fit(project, 18) + "  ", PROJECT),
+            *highlight(row["display_title"], self.query.lower().split(), title, HIT + (";1" if chosen else "")),
         ]
 
-    def draw(self, screen) -> None:
-        import curses
-        if self.style is None:
-            self.style = theme()
-        s = self.style
-        screen.erase()
-        height, width = screen.getmaxyx()
-
-        def put(y: int, x: int, segments: list[tuple[str, int]]) -> int:
-            for text, attr in segments:
-                room = width - x - 1
-                if not 0 <= y < height or room <= 0:
-                    break
-                try:
-                    screen.addnstr(y, x, text, room, attr)
-                except curses.error:
-                    pass  # Wide characters can overrun the last column.
-                x += len(text)
-            return x
-
-        now = datetime.now().timestamp()
-        self.page = max(1, height - 5)
+    def render(self, width: int, height: int) -> tuple[list[str], int]:
+        """Screen lines (prompt, rows, detail, hints) and the cursor column on the prompt line."""
+        width = max(10, width - 1)  # Never touch the last column, where terminals wrap.
+        self.page = max(1, height - 3)
         if self.index < self.top:
             self.top = self.index
         elif self.index >= self.top + self.page:
             self.top = self.index - self.page + 1
-        for line, row in enumerate(self.visible[self.top:self.top + self.page], 1):
-            chosen = self.top + line - 1 == self.index
-            if chosen:
-                put(line, 0, [(" " * width, s["sel_plain"])])
-            put(line, 0, self.row_segments(row, chosen, now))
-        if not self.visible:
-            put(2, 4, [("No matching sessions", s["dim"] | s["note"])])
-        put(height - 4, 0, [("─" * (width - 1), s["dim"])])
+        self.top = max(0, min(self.top, len(self.visible) - self.page))
+
+        info = [(f"{self.scope}  ", PROJECT)] if self.scope else []
+        info.append((f"{len(self.visible)}/{len(self.rows)}", DIM))
+        prompt = [("❯ ", ACCENT), (self.query, BOLD)]
+        gap = width - sum(cells(text) for text, _ in prompt + info)
+        lines = [self.paint(prompt + ([(" " * gap, "")] + info if gap > 0 else []), width)]
+
+        now = datetime.now().timestamp()
+        for i in range(self.top, self.top + self.page):
+            if i < len(self.visible):
+                chosen = i == self.index
+                lines.append(self.paint(self.row_segments(self.visible[i], chosen, now), width, chosen))
+            elif i == 0:
+                lines.append(self.paint([("  No matching sessions", DIM + ";" + NOTE)], width))
+            else:
+                lines.append("")
+
         row = self.selected
         if row:
-            put(height - 3, 2, [(f"{row['agent']}:{row['sid'][:8]}", s["accent"]),
-                                ("  " + row["cwd"].replace(str(Path.home()), "~", 1), s["dim"])])
-            put(height - 2, 2, [(row["display_note"], s["note"])])
-        footer = []
-        for key, label in self.KEYS:
-            footer += [(key, s["accent"]), (f" {label}   ", s["dim"])]
-        put(height - 1, 2, footer)
-        count = f"{len(self.visible)}/{len(self.rows)}"
-        right = [(self.scope + "  ", s["project"])] if self.scope else []
-        right.append((count, s["dim"]))
-        put(0, max(0, width - 1 - sum(len(t) for t, _ in right)), right)
-        cursor = put(0, 1, [("❯ ", s["accent"]), (self.query, curses.A_BOLD)])
+            detail = [("  " + f"{row['agent']}:{row['sid'][:8]}", ACCENT),
+                      ("  " + row["cwd"].replace(str(Path.home()), "~", 1), DIM)]
+            if row["display_note"]:
+                detail.append(("  " + row["display_note"], NOTE))
+            lines.append(self.paint(detail, width))
+        else:
+            lines.append("")
+        hints = [("  ", "")]
+        for key, label in self.HINTS:
+            hints += [(key, ACCENT), (f" {label}   ", DIM)]
+        lines.append(self.paint(hints, width))
+        return lines, min(width, cells("❯ " + self.query))
+
+    def paint(self, segments: list[tuple[str, str]], width: int, band: bool = False) -> str:
+        return paint(segments, width, band, self.color)
+
+
+def read_keys(fd: int) -> list[str]:
+    data = os.read(fd, 1024)
+    if data == b"\x1b" and select.select([fd], [], [], 0.03)[0]:
+        data += os.read(fd, 1024)  # Arrow keys can arrive split from their Esc prefix.
+    while True:
         try:
-            screen.move(0, min(width - 1, cursor))
-        except curses.error:
-            pass
+            return split_keys(data.decode())
+        except UnicodeDecodeError:
+            data += os.read(fd, 1)  # A multi-byte character was split across reads.
 
 
 def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: str = "") -> dict | None:
-    import curses
-    os.environ.setdefault("ESCDELAY", "25")  # Esc should quit without the default one-second pause.
-    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope)
+    """fzf-style inline picker: draws a few lines below the prompt and erases them on exit."""
+    color = not os.environ.get("NO_COLOR")
+    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope, color)
+    fd_in, fd_out = sys.stdin.fileno(), sys.stdout.fileno()
+    size = os.get_terminal_size(fd_out)
+    height = max(4, min(size.lines - 1, len(rows) + 3, max(12, size.lines * 2 // 5)))
 
-    def run(screen):
-        screen.keypad(True)
-        while True:
-            state.draw(screen)
-            action = state.handle(screen.get_wch())
-            if action == "quit":
-                return None
-            if action == "open":
-                return state.selected
+    def write(text: str) -> None:
+        os.write(fd_out, text.encode())
 
+    saved = termios.tcgetattr(fd_in)
     try:
-        return curses.wrapper(run)
-    except KeyboardInterrupt:
-        return None
+        tty.setraw(fd_in)
+        # Scroll the screen up if needed so the block fits, then return to its first line.
+        write("\x1b[?7l" + "\r\n" * (height - 1) + f"\x1b[{height - 1}A")
+        while True:
+            width = os.get_terminal_size(fd_out).columns
+            lines, column = state.render(width, height)
+            write("\x1b[?25l\r" + "\r\n".join("\x1b[2K" + line for line in lines)
+                  + f"\x1b[{height - 1}A\r" + (f"\x1b[{column}C" if column else "") + "\x1b[?25h")
+            for key in read_keys(fd_in):
+                action = state.handle(key)
+                if action == "quit":
+                    return None
+                if action == "open":
+                    return state.selected
+    finally:
+        write("\r\x1b[J\x1b[?7h\x1b[?25h")
+        termios.tcsetattr(fd_in, termios.TCSADRAIN, saved)
 
 
 def launch(row: sqlite3.Row, dry_run: bool = False) -> None:
