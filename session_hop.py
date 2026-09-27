@@ -786,7 +786,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pi-dir", type=Path, default=DEFAULT_PI, help="Pi session directory")
     parser.add_argument("--claude-dir", type=Path, default=DEFAULT_CLAUDE, help="Claude projects directory")
     parser.add_argument("--codex-dir", type=Path, default=DEFAULT_CODEX, help="Codex sessions directory")
-    sub = parser.add_subparsers(dest="command", required=True)
+    # An explicit prog keeps the custom top-level usage out of each command's own help.
+    sub = parser.add_subparsers(dest="command", required=True, prog="hop")
     sub.add_parser("sync", help="Index new and changed sessions")
     pick = sub.add_parser("pick", help="Choose a session and resume it (default)")
     pick.add_argument("query", nargs="*", help="Words in title, note, path, tags, or ID")
