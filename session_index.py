@@ -342,7 +342,10 @@ def clip(text: str, room: int) -> str:
 
 
 def fit(text: str, width: int) -> str:
-    return text[:width - 1] + "…" if len(text) > width else text.ljust(width)
+    # Pads by terminal columns so wide characters don't push the age column off the edge.
+    if cells(text) > width:
+        text = clip(text, width - 1) + "…"
+    return text + " " * (width - cells(text))
 
 
 def highlight(text: str, terms: list[str], style: str, hit: str) -> list[tuple[str, str]]:
@@ -368,7 +371,7 @@ def highlight(text: str, terms: list[str], style: str, hit: str) -> list[tuple[s
 # 34 = its blue, ...) rather than RGB values, so the terminal theme decides every actual
 # color. Yellow is the accent: most themes put their signature warm tone there.
 ACCENT, PROJECT, PATH, AGE, HIT, DIM, NOTE, BOLD = "1;33", "1;34", "34", "36", "1;4;33", "2", "3", "1"
-AGENT = {"claude": "35", "pi": "32"}
+AGENT = "33"  # The accent's hue without its weight, so agent names don't compete with the title.
 # The selected row's band: bright black is a muted gray on dark themes but near-black on light
 # ones, where the "white" slot is the muted gray instead.
 DARK_BAND, LIGHT_BAND = "100", "47"
@@ -472,16 +475,22 @@ class Picker:
             self.refilter()
         return None
 
-    def row_segments(self, row: dict, chosen: bool, now: float) -> list[tuple[str, str]]:
+    @staticmethod
+    def title_width(width: int) -> int:
+        # Star, agent, project and their gaps on the left; age right-aligned at the edge.
+        return max(5, width - 2 - 9 - 20 - 5)
+
+    def row_segments(self, row: dict, chosen: bool, now: float, width: int) -> list[tuple[str, str]]:
+        """Selection is every column in bold, plus a colored age; no band or bar."""
         project = Path(row["project"] or row["cwd"]).name or row["cwd"]
         title = BOLD if chosen else ""
         return [
-            ("▌ " if chosen else "  ", ACCENT),
             ("★ " if row["bookmarked"] else "  ", ACCENT),
-            (f"{row['agent']:<7}", AGENT.get(row["agent"], DIM)),
-            (f"{age(row['updated'], now):>6}  ", AGE),
-            (fit(project, 18) + "  ", PROJECT),
-            *highlight(row["display_title"], self.query.lower().split(), title, HIT + (";1" if chosen else "")),
+            (f"{row['agent']:<9}", f"{BOLD};{AGENT}" if chosen else AGENT),
+            (fit(project, 18) + "  ", PROJECT if chosen else PATH),
+            *highlight(fit(row["display_title"], self.title_width(width)), self.query.lower().split(),
+                       title, HIT + (";1" if chosen else "")),
+            (f"{age(row['updated'], now):>5}", f"{BOLD};{AGE}" if chosen else DIM),
         ]
 
     def render(self, width: int, height: int) -> tuple[list[str], int]:
@@ -499,33 +508,34 @@ class Picker:
         prompt = [("❯ ", ACCENT), (self.query, BOLD)]
         gap = width - sum(cells(text) for text, _ in prompt + info)
         lines = [self.paint(prompt + ([(" " * gap, "")] + info if gap > 0 else []), width),
-                 self.paint([(f"    {'agent':<7}{'age':>6}  {fit('project', 18)}  title", DIM)], width)]
+                 self.paint([(f"  {'agent':<9}{fit('project', 18)}  {fit('title', self.title_width(width))}{'age':>5}",
+                              DIM)], width)]
 
         now = datetime.now().timestamp()
         for i in range(self.top, self.top + self.page):
             if i < len(self.visible):
                 chosen = i == self.index
-                lines.append(self.paint(self.row_segments(self.visible[i], chosen, now), width,
-                                        self.band if chosen else ""))
+                lines.append(self.paint(self.row_segments(self.visible[i], chosen, now, width), width))
             elif i == 0:
                 lines.append(self.paint([("  No matching sessions", DIM + ";" + NOTE)], width))
             else:
                 lines.append("")
 
-        # The block below the list lines up with the agent column, after the bar and star.
-        indent = " " * 4
+        # Everything below the prompt lines up with the cursor, after the star gutter.
+        indent = " " * 2
         lines.append("")
         row = self.selected
         if row:
-            lines.append(self.paint([(indent + f"{row['agent']}:{row['sid'][:8]}", ACCENT),
-                                     (f"  {age(row['updated'], now)}", AGE),
-                                     ("  " + row["cwd"].replace(str(Path.home()), "~", 1), PATH)], width))
-            lines.append(self.paint([(indent + row["display_note"], NOTE)], width))
+            lines.append(self.paint([(indent + f"{row['agent']}:{row['sid'][:8]}", AGENT), ("  ·  ", DIM),
+                                     (row["cwd"].replace(str(Path.home()), "~", 1), PATH), ("  ·  ", DIM),
+                                     (age(row["updated"], now), AGE)], width))
+            lines.append(self.paint([(indent + fit(row["display_note"], width - len(indent)).rstrip(),
+                                      DIM + ";" + NOTE)], width))
         else:
             lines += ["", ""]
         hints = [(indent, "")]
-        for key, label in self.HINTS:
-            hints += [(key, ACCENT), (f" {label}   ", DIM)]
+        for i, (key, label) in enumerate(self.HINTS):
+            hints += [(key, BOLD), (f" {label}", DIM), ("   " if i < len(self.HINTS) - 1 else "", "")]
         lines.append(self.paint(hints, width))
         return lines, min(width, cells("❯ " + self.query))
 

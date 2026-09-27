@@ -266,17 +266,21 @@ class SessionIndexTests(unittest.TestCase):
         plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
         self.assertTrue(all(cells(line) <= 59 for line in plain))
         self.assertTrue(plain[0].startswith("❯ task") and plain[0].endswith("project p  20/20"))
-        self.assertEqual(sum("▌" in line for line in plain), 1)
-        self.assertEqual(plain[1].split(), ["agent", "age", "project", "title"])
-        chosen = next(line for line in plain if "▌" in line)
+        self.assertFalse(any("▌" in line for line in plain))
+        self.assertEqual(plain[1].split(), ["agent", "project", "title", "age"])
+        self.assertEqual(plain[1].index("agent"), cells("❯ "))  # Agent column lines up with the cursor.
+        chosen = next(line for line in plain if "Task 12" in line)
+        styled = lines[plain.index(chosen)]
+        for text in ("claude", "p ", "Task", "1970"):  # Every column of the active row is bold.
+            self.assertRegex(styled, r"\x1b\[0;1(;\d+)*m *" + re.escape(text))
         self.assertEqual(plain[1].index("title"), chosen.index("Task"))  # Column names line up with rows.
         self.assertIn("Task 12", "".join(plain))
         self.assertEqual(column, cells("❯ task"))
         codes = {code for line in lines for group in re.findall(r"\x1b\[([0-9;]*)m", line) for code in group.split(";")}
         self.assertTrue(codes <= {"", "0", "1", "2", "3", "4", "32", "33", "34", "35", "36", "100"}, codes)
         self.assertEqual(plain[-4], "")  # Breathing room between the list and the details.
-        self.assertTrue(plain[-3].startswith("    claude:id12  ") and plain[-3].endswith("  /p"))
-        self.assertEqual((plain[-2], plain[-1][:6]), ("    note", "    ↑↓"))
+        self.assertEqual(plain[-3], "  claude:id12  ·  /p  ·  1970")  # Agent, directory, age.
+        self.assertEqual((plain[-2], plain[-1][:4]), ("  note", "  ↑↓"))
         self.assertTrue(re.sub(r"\x1b\[[0-9;]*m", "", Picker(rows).render(60, 9)[0][0]).endswith("20/20"))
         no_color = Picker(rows, "task", color=False).render(60, 9)[0]
         self.assertNotRegex("".join(no_color), r"\x1b\[[0-9;]*(3\d|100)")
