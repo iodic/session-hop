@@ -1,4 +1,4 @@
-"""Session Hop: find and resume local Pi and Claude Code conversations."""
+"""Session Hop: find and resume local Pi, Claude Code, and Codex conversations."""
 
 from __future__ import annotations
 
@@ -23,7 +23,9 @@ LEGACY_DATA_DIR = DATA_ROOT / "agent-sessions"  # Before the Session Hop rename.
 DEFAULT_DB = DATA_DIR / "index.sqlite3"
 DEFAULT_PI = Path.home() / ".pi/agent/sessions"
 DEFAULT_CLAUDE = Path.home() / ".claude/projects"
-PARSER_VERSION = 1  # Bump when parse_session output changes to re-read unchanged files.
+DEFAULT_CODEX = Path.home() / ".codex/sessions"
+AGENTS = ("pi", "claude", "codex")
+PARSER_VERSION = 2  # Bump when parse_session output changes to re-read unchanged files.
 
 
 def clean(text: str, limit: int) -> str:
@@ -34,10 +36,13 @@ def clean(text: str, limit: int) -> str:
 SKILL_BLOCK = re.compile(r'<skill name="([^"]*)"[^>]*>.*?</skill>', re.S)
 COMMAND_NAME = re.compile(r"<command-name>(.*?)</command-name>", re.S)
 COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
-# Harness output echoed into user turns: command output, shell escapes, notifications, markers.
+# Harness output echoed into user turns: command output, shell escapes, notifications, markers,
+# and the instructions and environment Codex front-loads into the conversation.
 HARNESS_NOISE = re.compile(
-    r"<(local-command-[\w-]+|bash-[\w-]+|task-notification|system-reminder)>.*?</\1>"
-    r"|<!--.*?-->|\[Image #\d+\]|\[Request interrupted by user[^\]]*\]|\[Extension issues\].*", re.S)
+    r"<(local-command-[\w-]+|bash-[\w-]+|task-notification|system-reminder|environment_context"
+    r"|user_instructions|INSTRUCTIONS|t3_context|system_instruction|codex reminder)\b[^>]*>.*?</\1>"
+    r"|# AGENTS\.md instructions for [^\n]*"
+    r"|<!--.*?-->|\[Image[^\]]*\]|\[Attached image[^\]]*\]|\[Request interrupted by user[^\]]*\]|\[Extension issues\].*", re.S)
 
 
 def prompt_text(text: str) -> str:
@@ -57,12 +62,29 @@ def raw_text(content: object) -> str:
         return content
     if isinstance(content, list):
         return "\n".join(block.get("text", "") for block in content
-                         if isinstance(block, dict) and block.get("type") == "text"
+                         if isinstance(block, dict) and block.get("type") in ("text", "input_text")
                          and isinstance(block.get("text"), str))
     return ""
 
 
-def parse_session(agent: str, path: Path) -> dict | None:
+def codex_names(root: Path) -> dict[str, str]:
+    """Codex keeps thread names beside its sessions folder; a rename appends a line, so the last one wins."""
+    names = {}
+    try:
+        with (root.parent / "session_index.jsonl").open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry.get("thread_name"):
+                    names[entry["id"]] = str(entry["thread_name"])
+    except OSError:
+        pass
+    return names
+
+
+def parse_session(agent: str, path: Path, names: dict[str, str] | None = None) -> dict | None:
     sid = ""
     cwd = ""
     first = ""
@@ -71,6 +93,8 @@ def parse_session(agent: str, path: Path) -> dict | None:
     ai_title = ""
     command = ""  # A bare "/qa" is the title of last resort, if the agent went on to answer it.
     replied = False
+    codex_turns = []  # Older Codex sessions only record typed text as model input, next to injected context.
+    codex_typed = False
 
     def take(content: object) -> None:
         nonlocal first, last, command
@@ -104,6 +128,28 @@ def parse_session(agent: str, path: Path) -> dict | None:
                         take(message.get("content"))
                     elif isinstance(message, dict) and message.get("role") == "assistant":
                         replied = True
+            elif agent == "codex":
+                payload = entry.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if kind == "session_meta":
+                    source = payload.get("source")
+                    if source == "exec" or isinstance(source, dict):
+                        return None  # `codex exec` runs and sub-agents aren't conversations to return to.
+                    sid = payload.get("id") or sid
+                    cwd = payload.get("cwd") or cwd
+                elif kind == "event_msg" and payload.get("type") == "item_completed":
+                    item = payload.get("item")
+                    if isinstance(item, dict) and item.get("type") == "UserMessage":
+                        codex_typed = True
+                        take(item.get("content"))
+                    elif isinstance(item, dict) and item.get("type") == "AgentMessage":
+                        replied = True
+                elif kind == "response_item" and payload.get("type") == "message":
+                    if payload.get("role") == "user":
+                        codex_turns.append(payload.get("content"))
+                    elif payload.get("role") == "assistant":
+                        replied = True
             else:
                 if kind in ("user", "assistant", "ai-title", "custom-title", "agent-name"):
                     sid = entry.get("sessionId") or sid
@@ -118,6 +164,11 @@ def parse_session(agent: str, path: Path) -> dict | None:
                         take(message.get("content"))
                 elif kind == "assistant" and not entry.get("isSidechain"):
                     replied = True
+    if agent == "codex":
+        if not codex_typed:
+            for content in codex_turns:
+                take(content)
+        name = (names or {}).get(sid, "")
     first = first or (command if replied else "")
     last = last or first
     if agent == "claude":
@@ -192,6 +243,7 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path]) -> tuple[int, int]:
     for agent, root in sources.items():
         if not root.is_dir():
             continue  # A temporarily unavailable disk must not wipe the index.
+        names = codex_names(root) if agent == "codex" else None
         seen: set[str] = set()
         for path in root.rglob("*.jsonl"):
             if agent == "claude" and "subagents" in path.parts:
@@ -203,7 +255,7 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path]) -> tuple[int, int]:
                 seen.add(str(path))
                 if old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size:
                     continue
-                info = parse_session(agent, path)
+                info = parse_session(agent, path, names)
                 if not info:
                     # Nothing worth resuming, such as a lone "/clear". Drop a stale entry unless annotated.
                     removed += conn.execute(
@@ -224,10 +276,13 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path]) -> tuple[int, int]:
                 changed += 1
             except (OSError, ValueError, TypeError):
                 continue  # A deleted or malformed file does not stop the rest of the scan.
-        for row in conn.execute("SELECT sid, source_path FROM sessions WHERE agent=?", (agent,)).fetchall():
+        for row in conn.execute("SELECT sid, source_path, title FROM sessions WHERE agent=?", (agent,)).fetchall():
             if row["source_path"] not in seen:
                 conn.execute("DELETE FROM sessions WHERE agent=? AND sid=?", (agent, row["sid"]))
                 removed += 1
+            elif names and (name := clean(names.get(row["sid"], ""), 100)) and name != row["title"]:
+                # Renaming a Codex thread doesn't touch its session file, so apply names on every scan.
+                conn.execute("UPDATE sessions SET title=? WHERE agent=? AND sid=?", (name, agent, row["sid"]))
     # Rows indexed before project support are unchanged on disk, so fill them in here.
     for row in conn.execute("SELECT agent, sid, cwd FROM sessions WHERE project IS NULL").fetchall():
         if row["cwd"] not in roots:
@@ -287,8 +342,8 @@ def resolve(conn: sqlite3.Connection, key: str) -> sqlite3.Row:
     agent = None
     if ":" in key:
         agent, key = key.split(":", 1)
-        if agent not in ("pi", "claude"):
-            raise ValueError("Use pi:<id> or claude:<id>.")
+        if agent not in AGENTS:
+            raise ValueError("Use pi:<id>, claude:<id>, or codex:<id>.")
     if not key:
         raise ValueError("Provide a session ID prefix.")
     rows = [row for row in conn.execute("SELECT * FROM sessions" + (" WHERE agent=?" if agent else ""),
@@ -299,7 +354,11 @@ def resolve(conn: sqlite3.Connection, key: str) -> sqlite3.Row:
 
 
 def resume_argv(row: sqlite3.Row) -> list[str]:
-    return ["pi", "--session", row["source_path"]] if row["agent"] == "pi" else ["claude", "--resume", row["sid"]]
+    if row["agent"] == "pi":
+        return ["pi", "--session", row["source_path"]]
+    if row["agent"] == "codex":
+        return ["codex", "resume", row["sid"]]
+    return ["claude", "--resume", row["sid"]]
 
 
 def format_row(row) -> str:
@@ -642,7 +701,7 @@ def launch(row: sqlite3.Row, dry_run: bool = False) -> None:
 
 
 COMMANDS = {"sync", "find", "pick", "open", "rename", "title", "note", "tag", "bookmark", "bm", "unbookmark", "unbm"}
-GLOBAL_OPTIONS = {"--db", "--pi-dir", "--claude-dir"}
+GLOBAL_OPTIONS = {"--db", "--pi-dir", "--claude-dir", "--codex-dir"}
 
 
 def with_default_command(argv: list[str]) -> list[str]:
@@ -663,13 +722,14 @@ def with_default_command(argv: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="hop",
-        description="Session Hop: find and resume Pi and Claude Code sessions",
+        description="Session Hop: find and resume Pi, Claude Code, and Codex sessions",
         usage="hop [words ...] [-p PROJECT] [-b]\n       hop <command> ...",
         epilog="Without a command, words open the interactive picker: hop billbee",
         allow_abbrev=False)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite index path")
     parser.add_argument("--pi-dir", type=Path, default=DEFAULT_PI, help="Pi session directory")
     parser.add_argument("--claude-dir", type=Path, default=DEFAULT_CLAUDE, help="Claude projects directory")
+    parser.add_argument("--codex-dir", type=Path, default=DEFAULT_CODEX, help="Codex sessions directory")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("sync", help="Index new and changed sessions")
     for verb, help_text, limit in (("pick", "Choose a session and resume it (default)", None),
@@ -701,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
             migrate_legacy_data()
         conn = connect(args.db)
         try:
-            sources = {"pi": args.pi_dir, "claude": args.claude_dir}
+            sources = {"pi": args.pi_dir, "claude": args.claude_dir, "codex": args.codex_dir}
             if args.command == "sync":
                 updated, removed = sync(conn, sources)
                 print(f"Indexed {updated} changed sessions; removed {removed} missing sessions. {conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]} total.")

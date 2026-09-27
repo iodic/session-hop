@@ -20,13 +20,15 @@ class SessionIndexTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.pi = self.root / "pi"
         self.claude = self.root / "claude"
+        self.codex = self.root / "codex" / "sessions"
         self.pi.mkdir()
         self.claude.mkdir()
+        self.codex.mkdir(parents=True)
         self.project = self.root / "project"
         self.project.mkdir()
         self.db = connect(self.root / "private" / "index.sqlite3")
         self.addCleanup(self.db.close)
-        self.sources = {"pi": self.pi, "claude": self.claude}
+        self.sources = {"pi": self.pi, "claude": self.claude, "codex": self.codex}
 
     def write_lines(self, path, entries):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +83,7 @@ class SessionIndexTests(unittest.TestCase):
             {"type": "message", "message": {"role": "user", "content": "Fix billing"}},
         ])
         options = ["--db", str(self.root / "cli.sqlite3"), "--pi-dir", str(self.pi),
-                   "--claude-dir", str(self.claude)]
+                   "--claude-dir", str(self.claude), "--codex-dir", str(self.codex)]
         with patch("builtins.print"):
             self.assertEqual(main(options + ["rename", "pi:test-pi", "Better", "title"]), 0)
             self.assertEqual(main(options + ["note", "pi:test-pi", "Next", "step"]), 0)
@@ -120,7 +122,7 @@ class SessionIndexTests(unittest.TestCase):
 
     def cli(self, *args):
         options = ["--db", str(self.root / "cli.sqlite3"), "--pi-dir", str(self.pi),
-                   "--claude-dir", str(self.claude)]
+                   "--claude-dir", str(self.claude), "--codex-dir", str(self.codex)]
         with patch("builtins.print") as printed, patch.object(session_hop, "interactive", return_value=False):
             code = main(options + list(args))
         return code, "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
@@ -302,6 +304,50 @@ class SessionIndexTests(unittest.TestCase):
             session_hop.migrate_legacy_data()
             self.assertTrue(legacy.exists())
             self.assertEqual((current / "index.sqlite3").read_text(), "old")
+
+    def codex_session(self, sid, *entries):
+        meta = {"type": "session_meta", "payload": {"id": sid, "cwd": str(self.project), "originator": "codex_cli_rs"}}
+        return self.write_lines(self.codex / "2026" / "09" / "28" / f"rollout-2026-09-28T10-00-00-{sid}.jsonl",
+                                [meta, *entries])
+
+    def test_codex_sessions_use_typed_text_thread_names_and_resume(self):
+        injected = {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "# AGENTS.md instructions for /p\n\n<INSTRUCTIONS>Always commit</INSTRUCTIONS>"}]}}
+        typed = {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": [
+            {"type": "text", "text": "add game cards [Image: IMG_1.jpg; ref=image_1] [Attached image \"a.png\" is saved at: /tmp/a.png]\n<t3_context version=\"1\">x</t3_context>"}]}}}
+        answer = {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage"}}}
+        self.codex_session("01a0-new", injected, typed, answer)
+        sync(self.db, self.sources)
+        row = resolve(self.db, "codex:01a0-new")
+        self.assertEqual((row["title"], row["description"]), ("add game cards", "add game cards"))
+        with patch("builtins.print") as printed:
+            launch(row, dry_run=True)
+        self.assertIn("codex resume 01a0-new", printed.call_args.args[0])
+        # Renaming a thread only appends to Codex's own index; the next scan still picks it up.
+        (self.codex.parent / "session_index.jsonl").write_text(
+            json.dumps({"id": "01a0-new", "thread_name": "Old name"}) + "\n"
+            + json.dumps({"id": "01a0-new", "thread_name": "Game cards"}) + "\n")
+        self.assertEqual(sync(self.db, self.sources), (0, 0))
+        self.assertEqual(resolve(self.db, "01a0-new")["title"], "Game cards")
+
+    def test_older_codex_formats_fall_back_or_are_skipped(self):
+        context = {"type": "input_text", "text": "<environment_context><cwd>/p</cwd></environment_context>"}
+        self.codex_session("0199-old", {"type": "response_item", "payload": {"type": "message", "role": "user",
+            "content": [context, {"type": "input_text", "text": "fix the checkout"}]}})
+        self.write_lines(self.codex / "2025" / "07" / "rollout-2025-07-28-legacy.jsonl", [
+            {"id": "legacy", "timestamp": "2025-07-28T08:08:29Z", "instructions": None},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "no cwd recorded"}]}])
+        typed = {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+            "type": "UserMessage", "content": [{"type": "text", "text": "automated"}]}}}
+        for sid, source in (("exec-run", "exec"), ("sub-agent", {"subagent": "review"})):
+            path = self.codex_session(sid, typed)
+            lines = path.read_text().splitlines()
+            meta = json.loads(lines[0])
+            meta["payload"]["source"] = source
+            path.write_text("\n".join([json.dumps(meta), *lines[1:]]) + "\n")
+        self.assertEqual(sync(self.db, self.sources), (1, 0))
+        self.assertEqual([row["sid"] for row in search(self.db)], ["0199-old"])
+        self.assertEqual(resolve(self.db, "codex:0199")["title"], "fix the checkout")
 
 
 if __name__ == "__main__":
