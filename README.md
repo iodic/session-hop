@@ -1,5 +1,7 @@
 # Session Hop
 
+![Session Hop terminal picker with a pixel-art rabbit](assets/session-hop-banner.png)
+
 Session Hop finds your local Pi, Claude Code, and Codex conversations across every project and puts you back in one. Type a few words, pick a session, press Enter, and you're in the right directory with the conversation resumed.
 
 The command is `hop`. It reads the agents' session files and never changes them. It doesn't call an AI model or send anything over the network.
