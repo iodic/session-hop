@@ -12,6 +12,7 @@ import shlex
 import sqlite3
 import sys
 import termios
+import threading
 import time
 import tty
 import unicodedata
@@ -236,51 +237,63 @@ def project_root(cwd: str) -> str:
     return cwd
 
 
-def sync(conn: sqlite3.Connection, sources: dict[str, Path]) -> tuple[int, int]:
+def sync(conn: sqlite3.Connection, sources: dict[str, Path], progress=None) -> tuple[int, int]:
+    """Index new and changed session files. progress(done, total) is called as files are read."""
     changed = 0
     removed = 0
     roots: dict[str, str] = {}
+    # First find what changed, which is cheap, so progress can report a real total.
+    pending: list[tuple[str, Path, os.stat_result]] = []
+    seen: dict[str, set[str]] = {}
+    names: dict[str, dict[str, str] | None] = {}
     for agent, root in sources.items():
         if not root.is_dir():
             continue  # A temporarily unavailable disk must not wipe the index.
-        names = codex_names(root) if agent == "codex" else None
-        seen: set[str] = set()
+        names[agent] = codex_names(root) if agent == "codex" else None
+        seen[agent] = set()
         for path in root.rglob("*.jsonl"):
             if agent == "claude" and "subagents" in path.parts:
                 continue
             try:
                 stat = path.stat()
-                old = conn.execute("SELECT mtime_ns, size FROM sessions WHERE agent=? AND source_path=?",
-                                   (agent, str(path))).fetchone()
-                seen.add(str(path))
-                if old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size:
-                    continue
-                info = parse_session(agent, path, names)
-                if not info:
-                    # Nothing worth resuming, such as a lone "/clear". Drop a stale entry unless annotated.
-                    removed += conn.execute(
-                        "DELETE FROM sessions WHERE agent=? AND source_path=? AND custom_title IS NULL "
-                        "AND note IS NULL AND tags='' AND bookmarked=0", (agent, str(path))).rowcount
-                    continue
-                if info["cwd"] not in roots:
-                    roots[info["cwd"]] = project_root(info["cwd"])
-                conn.execute("""
-                    INSERT INTO sessions(agent, sid, cwd, title, description, source_path, mtime_ns, size, updated, project)
-                    VALUES (:agent, :sid, :cwd, :title, :description, :path, :mtime_ns, :size, :updated, :project)
-                    ON CONFLICT(agent, sid) DO UPDATE SET
-                        cwd=excluded.cwd, title=excluded.title, description=excluded.description,
-                        source_path=excluded.source_path, mtime_ns=excluded.mtime_ns,
-                        size=excluded.size, updated=excluded.updated, project=excluded.project
-                """, {**info, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "updated": stat.st_mtime,
-                      "project": roots[info["cwd"]]})
-                changed += 1
-            except (OSError, ValueError, TypeError):
-                continue  # A deleted or malformed file does not stop the rest of the scan.
+            except OSError:
+                continue
+            seen[agent].add(str(path))
+            old = conn.execute("SELECT mtime_ns, size FROM sessions WHERE agent=? AND source_path=?",
+                               (agent, str(path))).fetchone()
+            if not (old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size):
+                pending.append((agent, path, stat))
+    for done, (agent, path, stat) in enumerate(pending, 1):
+        if progress:
+            progress(done, len(pending))
+        try:
+            info = parse_session(agent, path, names[agent])
+            if not info:
+                # Nothing worth resuming, such as a lone "/clear". Drop a stale entry unless annotated.
+                removed += conn.execute(
+                    "DELETE FROM sessions WHERE agent=? AND source_path=? AND custom_title IS NULL "
+                    "AND note IS NULL AND tags='' AND bookmarked=0", (agent, str(path))).rowcount
+                continue
+            if info["cwd"] not in roots:
+                roots[info["cwd"]] = project_root(info["cwd"])
+            conn.execute("""
+                INSERT INTO sessions(agent, sid, cwd, title, description, source_path, mtime_ns, size, updated, project)
+                VALUES (:agent, :sid, :cwd, :title, :description, :path, :mtime_ns, :size, :updated, :project)
+                ON CONFLICT(agent, sid) DO UPDATE SET
+                    cwd=excluded.cwd, title=excluded.title, description=excluded.description,
+                    source_path=excluded.source_path, mtime_ns=excluded.mtime_ns,
+                    size=excluded.size, updated=excluded.updated, project=excluded.project
+            """, {**info, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "updated": stat.st_mtime,
+                  "project": roots[info["cwd"]]})
+            changed += 1
+        except (OSError, ValueError, TypeError):
+            continue  # A deleted or malformed file does not stop the rest of the scan.
+    for agent, paths in seen.items():
         for row in conn.execute("SELECT sid, source_path, title FROM sessions WHERE agent=?", (agent,)).fetchall():
-            if row["source_path"] not in seen:
+            if row["source_path"] not in paths:
                 conn.execute("DELETE FROM sessions WHERE agent=? AND sid=?", (agent, row["sid"]))
                 removed += 1
-            elif names and (name := clean(names.get(row["sid"], ""), 100)) and name != row["title"]:
+            elif names[agent] and (name := clean(names[agent].get(row["sid"], ""), 100)) and name != row["title"]:
                 # Renaming a Codex thread doesn't touch its session file, so apply names on every scan.
                 conn.execute("UPDATE sessions SET title=? WHERE agent=? AND sid=?", (name, agent, row["sid"]))
     # Rows indexed before project support are unchanged on disk, so fill them in here.
@@ -291,6 +304,64 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path]) -> tuple[int, int]:
                      (roots[row["cwd"]], row["agent"], row["sid"]))
     conn.commit()
     return changed, removed
+
+
+class Spinner:
+    """Shows progress on stderr once a scan has run for 200ms, so everyday runs stay silent.
+
+    It animates on its own thread, so a slow directory walk or one huge file still looks alive.
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, stream, delay: float = 0.2, color: bool = True):
+        self.stream = stream
+        self.delay = delay
+        self.color = color
+        self.done = self.total = 0
+        self.drawn = False
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def __call__(self, done: int, total: int) -> None:
+        self.done, self.total = done, total
+
+    def line(self, frame: int) -> str:
+        spin = self.FRAMES[frame % len(self.FRAMES)]
+        count = f"{self.done}/{self.total}" if self.total else ""
+        label = "Reading sessions" if self.total else "Checking for changed sessions"
+        if self.color:
+            spin, count = f"\x1b[33m{spin}\x1b[0m", f"\x1b[2m{count}\x1b[0m" if count else ""
+        return f"\r\x1b[2K{spin} {label} {count}".rstrip()
+
+    def run(self) -> None:
+        if self.stopped.wait(self.delay):
+            return
+        frame = 0
+        while not self.stopped.is_set():
+            self.stream.write(self.line(frame))
+            self.stream.flush()
+            self.drawn = True
+            frame += 1
+            self.stopped.wait(0.08)
+
+    def __enter__(self) -> "Spinner":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stopped.set()
+        self.thread.join()
+        if self.drawn:
+            self.stream.write("\r\x1b[2K")
+            self.stream.flush()
+
+
+def scan(conn: sqlite3.Connection, sources: dict[str, Path]) -> tuple[int, int]:
+    if not sys.stderr.isatty():
+        return sync(conn, sources)
+    with Spinner(sys.stderr, color=not os.environ.get("NO_COLOR")) as spinner:
+        return sync(conn, sources, spinner)
 
 
 def all_sessions(conn: sqlite3.Connection) -> list[dict]:
@@ -763,10 +834,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             sources = {"pi": args.pi_dir, "claude": args.claude_dir, "codex": args.codex_dir}
             if args.command == "sync":
-                updated, removed = sync(conn, sources)
+                updated, removed = scan(conn, sources)
                 print(f"Indexed {updated} changed sessions; removed {removed} missing sessions. {conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]} total.")
             elif args.command in ("find", "pick"):
-                sync(conn, sources)
+                scan(conn, sources)
                 query = " ".join(args.query)
                 if args.command == "find" or not interactive():
                     print_rows(search(conn, query, args.limit or 30, project=args.project,
@@ -781,10 +852,10 @@ def main(argv: list[str] | None = None) -> int:
                                           args.bookmarked and "★ bookmarked"]))):
                         launch(selected)
             elif args.command == "open":
-                sync(conn, sources)
+                scan(conn, sources)
                 launch(resolve(conn, args.id), args.dry_run)
             elif args.command in ("bookmark", "bm", "unbookmark", "unbm"):
-                sync(conn, sources)
+                scan(conn, sources)
                 row = resolve(conn, args.id)
                 adding = args.command in ("bookmark", "bm")
                 set_bookmark(conn, row, adding)
@@ -794,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
                     conn.commit()
                 print(f"{'Bookmarked' if adding else 'Removed bookmark from'} {row['agent']}:{row['sid']}.")
             else:
-                sync(conn, sources)
+                scan(conn, sources)
                 row = resolve(conn, args.id)
                 field = {"rename": "custom_title", "title": "custom_title", "note": "note", "tag": "tags"}[args.command]
                 text = clean(" ".join(args.text), 500)

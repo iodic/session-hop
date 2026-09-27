@@ -1,7 +1,9 @@
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -9,7 +11,7 @@ import re
 import sqlite3
 
 import session_hop
-from session_hop import (Picker, cells, connect, luminance, launch, main, parse_session, prompt_text, resolve, search,
+from session_hop import (Picker, Spinner, cells, connect, luminance, launch, main, parse_session, prompt_text, resolve, search,
                            split_keys, sync, with_default_command)
 
 
@@ -348,6 +350,31 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(sync(self.db, self.sources), (1, 0))
         self.assertEqual([row["sid"] for row in search(self.db)], ["0199-old"])
         self.assertEqual(resolve(self.db, "codex:0199")["title"], "fix the checkout")
+
+    def test_sync_reports_progress_over_changed_files_only(self):
+        for sid in ("a", "b", "c"):
+            self.pi_session(sid, self.project, f"Task {sid}")
+        calls = []
+        sync(self.db, self.sources, lambda done, total: calls.append((done, total)))
+        self.assertEqual(calls, [(1, 3), (2, 3), (3, 3)])
+        calls.clear()
+        self.pi_session("d", self.project, "Task d")
+        sync(self.db, self.sources, lambda done, total: calls.append((done, total)))
+        self.assertEqual(calls, [(1, 1)])
+
+    def test_spinner_silent_when_fast_and_cleans_up_when_slow(self):
+        fast = io.StringIO()
+        with Spinner(fast, delay=0.2) as spinner:
+            spinner(1, 2)
+        self.assertEqual(fast.getvalue(), "")
+        slow = io.StringIO()
+        with Spinner(slow, delay=0, color=False) as spinner:
+            time.sleep(0.03)
+            spinner(312, 1693)
+            time.sleep(0.2)  # Frames redraw every 80ms.
+        self.assertIn("Checking for changed sessions", slow.getvalue())
+        self.assertIn("Reading sessions 312/1693", slow.getvalue())
+        self.assertTrue(slow.getvalue().endswith("\r\x1b[2K"))  # The line is erased before the picker draws.
 
 
 if __name__ == "__main__":
