@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import re
 import select
-import shlex
 import sqlite3
 import sys
 import termios
@@ -742,16 +741,13 @@ def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: s
         termios.tcsetattr(fd_in, termios.TCSADRAIN, saved)
 
 
-def launch(row: sqlite3.Row, dry_run: bool = False) -> None:
+def launch(row: sqlite3.Row) -> None:
     cwd = Path(row["cwd"])
     if not cwd.is_dir():
         raise ValueError(f"Project directory no longer exists: {cwd}")
     if not Path(row["source_path"]).is_file():
         raise ValueError("Session file no longer exists; run 'hop sync'.")
     argv = resume_argv(row)
-    if dry_run:
-        print(f"cd {shlex.quote(str(cwd))} && {shlex.join(argv)}")
-        return
     os.chdir(cwd)
     os.execvp(argv[0], argv)
 
@@ -796,7 +792,6 @@ def main(argv: list[str] | None = None) -> int:
     pick.add_argument("--limit", type=int, help="Show at most this many of the newest sessions")
     opening = sub.add_parser("open", help="Resume a session by ID prefix")
     opening.add_argument("id")
-    opening.add_argument("--dry-run", action="store_true", help="Print the shell command instead")
     for verb, help_text in (("rename", "Set a session title"),
                             ("note", "Set a session description"),
                             ("tag", "Add a searchable tag")):
@@ -834,7 +829,7 @@ def main(argv: list[str] | None = None) -> int:
                     launch(selected)
             elif args.command == "open":
                 scan(conn, sources)
-                launch(resolve(conn, args.id), args.dry_run)
+                launch(resolve(conn, args.id))
             elif args.command in ("bookmark", "bm", "unbookmark", "unbm"):
                 scan(conn, sources)
                 row = resolve(conn, args.id)

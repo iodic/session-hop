@@ -32,6 +32,12 @@ class SessionIndexTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.sources = {"pi": self.pi, "claude": self.claude, "codex": self.codex}
 
+    def resumed(self, row):
+        """The directory launch() changes to and the command it replaces this process with."""
+        with patch("os.chdir") as chdir, patch("os.execvp") as execvp:
+            launch(row)
+        return str(chdir.call_args.args[0]), execvp.call_args.args[1]
+
     def write_lines(self, path, entries):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
@@ -50,10 +56,7 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(row["description"], "Fix the billing bug")
         self.assertNotIn("private secret", str(dict(row)))
         self.assertEqual(sync(self.db, self.sources), (0, 0))
-        with patch("builtins.print") as printed:
-            launch(row, dry_run=True)
-        self.assertIn(str(path), printed.call_args.args[0])
-        self.assertIn("pi --session", printed.call_args.args[0])
+        self.assertEqual(self.resumed(row), (str(self.project), ["pi", "--session", str(path)]))
 
     def test_claude_titles_and_manual_edits_survive_updates(self):
         path = self.write_lines(self.claude / "project" / "abc-123.jsonl", [
@@ -75,9 +78,7 @@ class SessionIndexTests(unittest.TestCase):
         row = search(self.db, "priority my title")[0]
         self.assertEqual(row["display_title"], "My title")
         self.assertEqual(row["display_note"], "Priority session")
-        with patch("builtins.print") as printed:
-            launch(row, dry_run=True)
-        self.assertIn("claude --resume abc-123", printed.call_args.args[0])
+        self.assertEqual(self.resumed(row)[1], ["claude", "--resume", "abc-123"])
 
     def test_rename_changes_title_not_note_and_title_alias_still_works(self):
         self.write_lines(self.pi / "2026_test-pi.jsonl", [
@@ -325,9 +326,7 @@ class SessionIndexTests(unittest.TestCase):
         sync(self.db, self.sources)
         row = resolve(self.db, "codex:01a0-new")
         self.assertEqual((row["title"], row["description"]), ("add game cards", "add game cards"))
-        with patch("builtins.print") as printed:
-            launch(row, dry_run=True)
-        self.assertIn("codex resume 01a0-new", printed.call_args.args[0])
+        self.assertEqual(self.resumed(row), (str(self.project), ["codex", "resume", "01a0-new"]))
         # Renaming a thread only appends to Codex's own index; the next scan still picks it up.
         (self.codex.parent / "session_index.jsonl").write_text(
             json.dumps({"id": "01a0-new", "thread_name": "Old name"}) + "\n"

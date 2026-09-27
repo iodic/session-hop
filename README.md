@@ -95,12 +95,6 @@ hop open 01a0da86
 | Claude Code | `claude --resume <id>` |
 | Codex | `codex resume <id>` |
 
-To see the command without running it, add `--dry-run`. Here the ID includes the agent:
-
-```bash
-hop open claude:0c2f90be --dry-run
-```
-
 ### Rename a session
 
 ```bash
