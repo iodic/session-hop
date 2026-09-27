@@ -383,7 +383,7 @@ def paint(segments: list[tuple[str, str]], width: int, band: str = "", color: bo
     for text, style in segments:
         text = clip(text, width - used)
         if not text:
-            break
+            continue  # An empty segment, such as a blank query, must not hide the ones after it.
         codes = [code for code in style.split(";") if code
                  and not (band and code == DIM) and (color or not COLOR_CODE.match(code))]
         if band:

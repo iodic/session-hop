@@ -277,6 +277,7 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(plain[-4], "")  # Breathing room between the list and the details.
         self.assertTrue(plain[-3].startswith("    claude:id12  ") and plain[-3].endswith("  /p"))
         self.assertEqual((plain[-2], plain[-1][:6]), ("    note", "    ↑↓"))
+        self.assertTrue(re.sub(r"\x1b\[[0-9;]*m", "", Picker(rows).render(60, 9)[0][0]).endswith("20/20"))
         no_color = Picker(rows, "task", color=False).render(60, 9)[0]
         self.assertNotRegex("".join(no_color), r"\x1b\[[0-9;]*(3\d|100)")
 
