@@ -132,8 +132,10 @@ class SessionIndexTests(unittest.TestCase):
                 patch.object(session_hop, "picker", return_value=None) as shown:
             code = main(options + list(args))
         out = "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
-        rows, query = shown.call_args.args[1:3] if shown.called else ([], None)
-        return code, out, Picker(rows, query or "").visible
+        if not shown.called:
+            return code, out, []
+        rows, query, _, bookmarked = shown.call_args.args[1:5]
+        return code, out, Picker(rows, query, bookmarked=bookmarked).visible
 
     def pi_session(self, sid, cwd, text):
         self.write_lines(self.pi / f"2026_{sid}.jsonl", [
@@ -189,7 +191,7 @@ class SessionIndexTests(unittest.TestCase):
         shown = self.cli("-b")[2]
         self.assertEqual([(row["sid"], row["display_note"]) for row in shown], [("01a0da86", "needs tests")])
         self.assertEqual(self.cli("unbookmark", "01a0")[0], 0)
-        self.assertIn("No sessions found.", self.cli("-b")[1])
+        self.assertEqual(self.cli("-b")[2], [])
 
     def test_picker_filters_moves_bookmarks_and_opens(self):
         rows = [{"agent": "pi", "sid": s, "cwd": "/p", "project": "/p", "display_title": t,
@@ -203,6 +205,12 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(picker.selected["sid"], "b")
         picker.handle("tab")
         self.assertEqual(toggled, [("b", True)])
+        rows[1]["bookmarked"] = 1  # What the bookmark callback does to the row.
+        picker.handle("starred")
+        self.assertEqual([r["sid"] for r in picker.visible], ["b"])  # Ctrl-S: bookmarked only.
+        self.assertIn("★ bookmarked", picker.render(80, 9)[0][0])
+        picker.handle("starred")
+        self.assertEqual([r["sid"] for r in picker.visible], ["a", "b"])
         for key in " stock":
             picker.handle(key)
         self.assertEqual([r["sid"] for r in picker.visible], ["b"])
@@ -261,6 +269,7 @@ class SessionIndexTests(unittest.TestCase):
     def test_split_keys_handles_sequences_batches_and_text(self):
         self.assertEqual(split_keys("\x1b[B\x1b[Bab\r"), ["down", "down", "a", "b", "enter"])
         self.assertEqual(split_keys("\x1bOA\x1b"), ["up", "esc"])
+        self.assertEqual(split_keys("\x13"), ["starred"])
         self.assertEqual(split_keys("\x1b[1;5C\x01ž"), ["ž"])  # Unknown keys are ignored.
 
     def test_render_fits_height_and_width_with_theme_palette_only(self):

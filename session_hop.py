@@ -523,7 +523,7 @@ def paint(segments: list[tuple[str, str]], width: int, band: str = "", color: bo
 KEY_NAMES = {"\x1b[A": "up", "\x1bOA": "up", "\x10": "up", "\x1b[B": "down", "\x1bOB": "down", "\x0e": "down",
              "\x1b[5~": "pageup", "\x1b[6~": "pagedown", "\r": "enter", "\n": "enter", "\t": "tab",
              "\x7f": "backspace", "\x08": "backspace", "\x15": "clear", "\x17": "word",
-             "\x1b": "esc", "\x03": "esc", "\x07": "esc"}
+             "\x1b": "esc", "\x03": "esc", "\x07": "esc", "\x13": "starred"}
 ESCAPE_SEQUENCE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|O.)")
 
 
@@ -545,13 +545,15 @@ def split_keys(data: str) -> list[str]:
 class Picker:
     """Filter-as-you-type session list. Renders to strings so it can be tested without a terminal."""
 
-    HINTS = (("↑↓", "move"), ("⏎", "open"), ("tab", "bookmark"), ("esc", "quit"))
+    HINTS = (("↑↓", "move"), ("⏎", "open"), ("tab", "bookmark"), ("ctrl-s", "bookmarked only"), ("esc", "quit"))
 
-    def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = "", color: bool = True):
+    def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = "", color: bool = True,
+                 bookmarked: bool = False):
         self.rows = rows
         self.query = query
         self.on_bookmark = on_bookmark
         self.scope = scope
+        self.bookmarked = bookmarked  # Ctrl-S shows only bookmarked sessions.
         self.color = color
         self.band = DARK_BAND
         self.index = 0
@@ -560,8 +562,10 @@ class Picker:
         self.refilter()
 
     def refilter(self) -> None:
+        # Unbookmarking a row doesn't hide it until the list is filtered again, so Tab can undo it.
         terms = self.query.casefold().split()
-        self.visible = [row for row in self.rows if matches(row, terms)]
+        self.visible = [row for row in self.rows
+                        if (row["bookmarked"] or not self.bookmarked) and matches(row, terms)]
         self.index = 0
 
     @property
@@ -579,6 +583,9 @@ class Picker:
             return "quit"
         if key in ("up", "down", "pageup", "pagedown"):
             self.move({"up": -1, "down": 1, "pageup": -self.page, "pagedown": self.page}[key])
+        elif key == "starred":
+            self.bookmarked = not self.bookmarked
+            self.refilter()
         elif key == "tab":
             row = self.selected
             if row and self.on_bookmark:
@@ -626,6 +633,8 @@ class Picker:
         self.top = max(0, min(self.top, len(self.visible) - self.page))
 
         info = [(f"{self.scope}  ", PROJECT)] if self.scope else []
+        if self.bookmarked:
+            info.append(("★ bookmarked  ", ACCENT))
         info.append((f"{len(self.visible)}/{len(self.rows)}", DIM))
         prompt = [("❯ ", ACCENT), (self.query, BOLD)]
         gap = width - sum(cells(text) for text, _ in prompt + info)
@@ -705,10 +714,11 @@ def light_background(fd_in: int, fd_out: int) -> tuple[bool, bytes]:
     return level > 0.5, typed
 
 
-def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: str = "") -> dict | None:
+def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: str = "",
+           bookmarked: bool = False) -> dict | None:
     """fzf-style inline picker: draws a few lines below the prompt and erases them on exit."""
     color = not os.environ.get("NO_COLOR")
-    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope, color)
+    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope, color, bookmarked)
     fd_in, fd_out = sys.stdin.fileno(), sys.stdout.fileno()
     size = os.get_terminal_size(fd_out)
     height = max(7, min(size.lines - 1, len(rows) + 6, max(12, size.lines * 2 // 5)))
@@ -820,12 +830,12 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("the picker needs a terminal; use 'hop open <id>' to resume by ID.")
                 scan(conn, sources)
                 # The picker filters as you type, so it starts from every candidate.
-                rows = search(conn, "", args.limit, project=args.project, bookmarked=args.bookmarked)
+                # -b only starts the picker in bookmarked mode, so Ctrl-S can still show everything.
+                rows = search(conn, "", args.limit, project=args.project)
                 if not rows:
                     print("No sessions found.")
-                elif selected := picker(conn, rows, " ".join(args.query), " · ".join(
-                        filter(None, [args.project and f"project {args.project}",
-                                      args.bookmarked and "★ bookmarked"]))):
+                elif selected := picker(conn, rows, " ".join(args.query),
+                                        f"project {args.project}" if args.project else "", args.bookmarked):
                     launch(selected)
             elif args.command == "open":
                 scan(conn, sources)

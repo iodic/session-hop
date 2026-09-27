@@ -65,7 +65,7 @@ This shows sessions from every project whose name contains "fizzy".
 hop -b
 ```
 
-`-b` shows only bookmarked sessions. It combines with search words and `-p`.
+`-b` opens the picker showing only bookmarked sessions. It combines with search words and `-p`. Inside the picker, Ctrl-S switches between bookmarked sessions and all of them.
 
 ### Bookmark a session
 
@@ -140,6 +140,7 @@ The picker draws below your prompt, like `fzf --height`, and erases itself when 
 | PgUp PgDn | Move a page |
 | Backspace, Ctrl-W, Ctrl-U | Delete a character, a word, or the whole query |
 | Tab | Toggle bookmark |
+| Ctrl-S | Show only bookmarked sessions, or all again |
 | Enter | Resume the session |
 | Esc, Ctrl-C | Quit |
 
