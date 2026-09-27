@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from session_index import connect, launch, parse_session, resolve, search, sync
+from session_index import connect, launch, main, parse_session, resolve, search, sync
 
 
 class SessionIndexTests(unittest.TestCase):
@@ -69,6 +69,25 @@ class SessionIndexTests(unittest.TestCase):
         with patch("builtins.print") as printed:
             launch(row, dry_run=True)
         self.assertIn("claude --resume abc-123", printed.call_args.args[0])
+
+    def test_rename_changes_title_not_note_and_title_alias_still_works(self):
+        self.write_lines(self.pi / "2026_test-pi.jsonl", [
+            {"type": "session", "id": "test-pi", "cwd": str(self.project)},
+            {"type": "message", "message": {"role": "user", "content": "Fix billing"}},
+        ])
+        options = ["--db", str(self.root / "cli.sqlite3"), "--pi-dir", str(self.pi),
+                   "--claude-dir", str(self.claude)]
+        with patch("builtins.print"):
+            self.assertEqual(main(options + ["rename", "pi:test-pi", "Better", "title"]), 0)
+            self.assertEqual(main(options + ["note", "pi:test-pi", "Next", "step"]), 0)
+        with connect(self.root / "cli.sqlite3") as conn:
+            row = search(conn, "better next")[0]
+            self.assertEqual(row["display_title"], "Better title")
+            self.assertEqual(row["display_note"], "Next step")
+        with patch("builtins.print"):
+            self.assertEqual(main(options + ["title", "pi:test-pi", "Alias", "works"]), 0)
+        with connect(self.root / "cli.sqlite3") as conn:
+            self.assertEqual(search(conn, "alias works")[0]["display_title"], "Alias works")
 
     def test_missing_file_removed_but_missing_root_preserved(self):
         path = self.write_lines(self.pi / "2026_test-pi.jsonl", [

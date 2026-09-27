@@ -236,8 +236,10 @@ def main(argv: list[str] | None = None) -> int:
     opening = sub.add_parser("open", help="Resume a session by ID prefix")
     opening.add_argument("id")
     opening.add_argument("--dry-run", action="store_true", help="Print the shell command instead")
-    for verb in ("title", "note", "tag"):
-        cmd = sub.add_parser(verb, help=f"Set a manual {verb} on a session")
+    for verb, help_text in (("rename", "Set a session title"),
+                            ("note", "Set a session description"),
+                            ("tag", "Add a searchable tag")):
+        cmd = sub.add_parser(verb, aliases=["title"] if verb == "rename" else [], help=help_text)
         cmd.add_argument("id")
         cmd.add_argument("text", nargs="+", help="New text")
     args = parser.parse_args(argv)
@@ -269,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 sync(conn, sources)
                 row = resolve(conn, args.id)
-                field = {"title": "custom_title", "note": "note", "tag": "tags"}[args.command]
+                field = {"rename": "custom_title", "title": "custom_title", "note": "note", "tag": "tags"}[args.command]
                 text = clean(" ".join(args.text), 500)
                 if args.command == "tag":
                     text = " ".join(dict.fromkeys((row["tags"] + " " + text).split()))
