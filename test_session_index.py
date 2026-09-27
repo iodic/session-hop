@@ -9,7 +9,7 @@ import re
 import sqlite3
 
 import session_index
-from session_index import (Picker, cells, connect, launch, main, parse_session, prompt_text, resolve, search,
+from session_index import (Picker, cells, connect, luminance, launch, main, parse_session, prompt_text, resolve, search,
                            split_keys, sync, with_default_command)
 
 
@@ -270,9 +270,16 @@ class SessionIndexTests(unittest.TestCase):
         self.assertIn("Task 12", "".join(plain))
         self.assertEqual(column, cells("❯ task"))
         codes = {code for line in lines for group in re.findall(r"\x1b\[([0-9;]*)m", line) for code in group.split(";")}
-        self.assertTrue(codes <= {"", "0", "1", "2", "3", "4", "33", "34", "100"}, codes)
+        self.assertTrue(codes <= {"", "0", "1", "2", "3", "4", "32", "33", "34", "35", "36", "100"}, codes)
+        self.assertEqual(plain[-3], "")  # Breathing room between the list and the detail line.
         no_color = Picker(rows, "task", color=False).render(60, 8)[0]
         self.assertNotRegex("".join(no_color), r"\x1b\[[0-9;]*(3\d|100)")
+
+    def test_luminance_reads_osc11_replies(self):
+        self.assertGreater(luminance(b"\x1b]11;rgb:f8f8/f9f9/fafa\x07"), 0.9)
+        self.assertLess(luminance(b"\x1b]11;rgb:0b0b/0e0e/1414\x1b\\"), 0.1)
+        self.assertLess(luminance(b"\x1b]11;rgb:1f/24/30\x07"), 0.2)
+        self.assertIsNone(luminance(b"\x1b[?62;22c"))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import shlex
 import sqlite3
 import sys
 import termios
+import time
 import tty
 import unicodedata
 from datetime import datetime
@@ -364,15 +365,19 @@ def highlight(text: str, terms: list[str], style: str, hit: str) -> list[tuple[s
 
 
 # Styles are SGR parameters naming the terminal's own palette slots (33 = its yellow,
-# 34 = its blue, 100 = its bright black) rather than RGB values, so the terminal theme
-# decides every actual color. Yellow is the accent: most themes put their signature warm tone there.
-ACCENT, PROJECT, HIT, DIM, NOTE, BOLD = "1;33", "34", "1;4;33", "2", "3", "1"
-BAND = "100"
+# 34 = its blue, ...) rather than RGB values, so the terminal theme decides every actual
+# color. Yellow is the accent: most themes put their signature warm tone there.
+ACCENT, PROJECT, PATH, AGE, HIT, DIM, NOTE, BOLD = "1;33", "1;34", "34", "36", "1;4;33", "2", "3", "1"
+AGENT = {"claude": "35", "pi": "32"}
+# The selected row's band: bright black is a muted gray on dark themes but near-black on light
+# ones, where the "white" slot is the muted gray instead.
+DARK_BAND, LIGHT_BAND = "100", "47"
 COLOR_CODE = re.compile(r"^(3|4|9|10)\d$")
 
 
-def paint(segments: list[tuple[str, str]], width: int, band: bool = False, color: bool = True) -> str:
+def paint(segments: list[tuple[str, str]], width: int, band: str = "", color: bool = True) -> str:
     """One screen line: styled segments clipped to width, the selected row padded into a band."""
+    band = band and (band if color else "7")
     out = []
     used = 0
     for text, style in segments:
@@ -382,11 +387,11 @@ def paint(segments: list[tuple[str, str]], width: int, band: bool = False, color
         codes = [code for code in style.split(";") if code
                  and not (band and code == DIM) and (color or not COLOR_CODE.match(code))]
         if band:
-            codes.append(BAND if color else "7")
+            codes.append(band)
         out.append(f"\x1b[0;{';'.join(codes)}m{text}" if codes else f"\x1b[0m{text}")
         used += cells(text)
     if band and used < width:
-        out.append(f"\x1b[0;{BAND if color else '7'}m" + " " * (width - used))
+        out.append(f"\x1b[0;{band}m" + " " * (width - used))
     return "".join(out) + "\x1b[0m"
 
 
@@ -423,6 +428,7 @@ class Picker:
         self.on_bookmark = on_bookmark
         self.scope = scope
         self.color = color
+        self.band = DARK_BAND
         self.index = 0
         self.top = 0
         self.page = 10
@@ -472,16 +478,16 @@ class Picker:
         return [
             ("▌ " if chosen else "  ", ACCENT),
             ("★ " if row["bookmarked"] else "  ", ACCENT),
-            (f"{row['agent']:<7}", DIM),
-            (f"{age(row['updated'], now):>6}  ", DIM),
+            (f"{row['agent']:<7}", AGENT.get(row["agent"], DIM)),
+            (f"{age(row['updated'], now):>6}  ", AGE),
             (fit(project, 18) + "  ", PROJECT),
             *highlight(row["display_title"], self.query.lower().split(), title, HIT + (";1" if chosen else "")),
         ]
 
     def render(self, width: int, height: int) -> tuple[list[str], int]:
-        """Screen lines (prompt, rows, detail, hints) and the cursor column on the prompt line."""
+        """Screen lines (prompt, rows, gap, detail, hints) and the cursor column on the prompt line."""
         width = max(10, width - 1)  # Never touch the last column, where terminals wrap.
-        self.page = max(1, height - 3)
+        self.page = max(1, height - 4)
         if self.index < self.top:
             self.top = self.index
         elif self.index >= self.top + self.page:
@@ -498,16 +504,18 @@ class Picker:
         for i in range(self.top, self.top + self.page):
             if i < len(self.visible):
                 chosen = i == self.index
-                lines.append(self.paint(self.row_segments(self.visible[i], chosen, now), width, chosen))
+                lines.append(self.paint(self.row_segments(self.visible[i], chosen, now), width,
+                                        self.band if chosen else ""))
             elif i == 0:
                 lines.append(self.paint([("  No matching sessions", DIM + ";" + NOTE)], width))
             else:
                 lines.append("")
 
+        lines.append("")
         row = self.selected
         if row:
             detail = [("  " + f"{row['agent']}:{row['sid'][:8]}", ACCENT),
-                      ("  " + row["cwd"].replace(str(Path.home()), "~", 1), DIM)]
+                      ("  " + row["cwd"].replace(str(Path.home()), "~", 1), PATH)]
             if row["display_note"]:
                 detail.append(("  " + row["display_note"], NOTE))
             lines.append(self.paint(detail, width))
@@ -519,7 +527,7 @@ class Picker:
         lines.append(self.paint(hints, width))
         return lines, min(width, cells("❯ " + self.query))
 
-    def paint(self, segments: list[tuple[str, str]], width: int, band: bool = False) -> str:
+    def paint(self, segments: list[tuple[str, str]], width: int, band: str = "") -> str:
         return paint(segments, width, band, self.color)
 
 
@@ -534,13 +542,42 @@ def read_keys(fd: int) -> list[str]:
             data += os.read(fd, 1)  # A multi-byte character was split across reads.
 
 
+def luminance(reply: bytes) -> float | None:
+    """Brightness 0-1 of an OSC 11 background-color reply such as ESC ] 11;rgb:f8f8/f9f9/fafa."""
+    match = re.search(rb"\]11;rgba?:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", reply)
+    if not match:
+        return None
+    red, green, blue = (int(part, 16) / (16 ** len(part) - 1) for part in match.groups())
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def light_background(fd_in: int, fd_out: int) -> tuple[bool, bytes]:
+    """Ask the terminal for its background (OSC 11), so the band suits light and dark themes.
+
+    Device attributes (DA1) follow as a sentinel every terminal answers, so an unsupported query
+    costs no timeout. Returns whether the theme is light, plus any keys typed meanwhile.
+    """
+    os.write(fd_out, b"\x1b]11;?\x07\x1b[c")
+    data = b""
+    deadline = time.monotonic() + 0.5
+    while not re.search(rb"\x1b\[\?[0-9;]*c", data) and (left := deadline - time.monotonic()) > 0:
+        if select.select([fd_in], [], [], left)[0]:
+            data += os.read(fd_in, 1024)
+    level = luminance(data)
+    typed = re.sub(rb"\x1b\]11;[^\x07\x1b]*(\x07|\x1b\\)|\x1b\[\?[0-9;]*c", b"", data)
+    if level is None:
+        # COLORFGBG is "fg;bg" in palette slots; 7 and 15 are the white slots.
+        level = 1.0 if os.environ.get("COLORFGBG", "").split(";")[-1] in ("7", "15") else 0.0
+    return level > 0.5, typed
+
+
 def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: str = "") -> dict | None:
     """fzf-style inline picker: draws a few lines below the prompt and erases them on exit."""
     color = not os.environ.get("NO_COLOR")
     state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope, color)
     fd_in, fd_out = sys.stdin.fileno(), sys.stdout.fileno()
     size = os.get_terminal_size(fd_out)
-    height = max(4, min(size.lines - 1, len(rows) + 3, max(12, size.lines * 2 // 5)))
+    height = max(5, min(size.lines - 1, len(rows) + 4, max(12, size.lines * 2 // 5)))
 
     def write(text: str) -> None:
         os.write(fd_out, text.encode())
@@ -548,6 +585,10 @@ def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: s
     saved = termios.tcgetattr(fd_in)
     try:
         tty.setraw(fd_in)
+        light, typed = light_background(fd_in, fd_out)
+        state.band = LIGHT_BAND if light else DARK_BAND
+        for key in split_keys(typed.decode(errors="ignore")):
+            state.handle(key)
         # Scroll the screen up if needed so the block fits, then return to its first line.
         write("\x1b[?7l" + "\r\n" * (height - 1) + f"\x1b[{height - 1}A")
         while True:
