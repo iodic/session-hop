@@ -193,17 +193,18 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(self.cli("unbookmark", "01a0")[0], 0)
         self.assertEqual(self.cli("-b")[2], [])
 
-    def test_picker_filters_moves_bookmarks_and_opens(self):
-        rows = [{"agent": "pi", "sid": s, "cwd": "/p", "project": "/p", "display_title": t,
+    def test_picker_filters_moves_scopes_bookmarks_and_opens(self):
+        rows = [{"agent": "pi", "sid": s, "cwd": cwd, "project": cwd, "display_title": title,
                  "display_note": "", "tags": "", "bookmarked": 0, "updated": 0}
-                for s, t in (("a", "Billbee orders"), ("b", "Billbee stock"), ("c", "Other"))]
+                for s, cwd, title in (("a", "/p", "Billbee orders"), ("b", "/p", "Billbee stock"),
+                                      ("c", "/other", "Other"))]
         toggled = []
-        picker = Picker(rows, "billbee", lambda row, value: toggled.append((row["sid"], value)))
+        picker = Picker(rows, "billbee", lambda row, value: toggled.append((row["sid"], value)), cwd="/p")
         self.assertEqual([r["sid"] for r in picker.visible], ["a", "b"])
         picker.handle("down")
         picker.handle("down")
         self.assertEqual(picker.selected["sid"], "b")
-        picker.handle("tab")
+        picker.handle("bookmark")
         self.assertEqual(toggled, [("b", True)])
         rows[1]["bookmarked"] = 1  # What the bookmark callback does to the row.
         picker.handle("starred")
@@ -216,6 +217,11 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual([r["sid"] for r in picker.visible], ["b"])
         self.assertEqual(picker.handle("enter"), "open")
         picker.handle("clear")
+        self.assertEqual(len(picker.visible), 3)
+        picker.handle("tab")
+        self.assertEqual([r["sid"] for r in picker.visible], ["a", "b"])
+        self.assertIn("cwd p", picker.render(80, 9)[0][0])
+        picker.handle("tab")
         self.assertEqual(len(picker.visible), 3)
         self.assertEqual(picker.handle("esc"), "quit")
 
@@ -269,7 +275,7 @@ class SessionIndexTests(unittest.TestCase):
     def test_split_keys_handles_sequences_batches_and_text(self):
         self.assertEqual(split_keys("\x1b[B\x1b[Bab\r"), ["down", "down", "a", "b", "enter"])
         self.assertEqual(split_keys("\x1bOA\x1b"), ["up", "esc"])
-        self.assertEqual(split_keys("\x13"), ["starred"])
+        self.assertEqual(split_keys("\x02\x13\t"), ["bookmark", "starred", "tab"])
         self.assertEqual(split_keys("\x1b[1;5C\x01ž"), ["ž"])  # Unknown keys are ignored.
 
     def test_render_fits_height_and_width_with_theme_palette_only(self):
@@ -282,7 +288,7 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(len(lines), 9)
         plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
         self.assertTrue(all(cells(line) <= 59 for line in plain))
-        self.assertTrue(plain[0].startswith("❯ task") and plain[0].endswith("project p  20/20"))
+        self.assertTrue(plain[0].startswith("❯ task") and plain[0].endswith("project p  all  20/20"))
         self.assertFalse(any("▌" in line for line in plain))
         self.assertEqual(plain[1].split(), ["agent", "project", "title", "age"])
         self.assertEqual(plain[1].index("agent"), cells("❯ "))  # Agent column lines up with the cursor.
@@ -298,7 +304,7 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(plain[-4], "")  # Breathing room between the list and the details.
         self.assertEqual(plain[-3], "  claude:id12  ·  /p  ·  1970")  # Agent, directory, age.
         self.assertEqual((plain[-2], plain[-1][:4]), ("  note", "  ↑↓"))
-        self.assertTrue(re.sub(r"\x1b\[[0-9;]*m", "", Picker(rows).render(60, 9)[0][0]).endswith("20/20"))
+        self.assertTrue(re.sub(r"\x1b\[[0-9;]*m", "", Picker(rows).render(60, 9)[0][0]).endswith("all  20/20"))
         no_color = Picker(rows, "task", color=False).render(60, 9)[0]
         self.assertNotRegex("".join(no_color), r"\x1b\[[0-9;]*(3\d|100)")
 

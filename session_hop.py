@@ -523,7 +523,7 @@ def paint(segments: list[tuple[str, str]], width: int, band: str = "", color: bo
 KEY_NAMES = {"\x1b[A": "up", "\x1bOA": "up", "\x10": "up", "\x1b[B": "down", "\x1bOB": "down", "\x0e": "down",
              "\x1b[5~": "pageup", "\x1b[6~": "pagedown", "\r": "enter", "\n": "enter", "\t": "tab",
              "\x7f": "backspace", "\x08": "backspace", "\x15": "clear", "\x17": "word",
-             "\x1b": "esc", "\x03": "esc", "\x07": "esc", "\x13": "starred"}
+             "\x1b": "esc", "\x03": "esc", "\x07": "esc", "\x02": "bookmark", "\x13": "starred"}
 ESCAPE_SEQUENCE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|O.)")
 
 
@@ -545,15 +545,19 @@ def split_keys(data: str) -> list[str]:
 class Picker:
     """Filter-as-you-type session list. Renders to strings so it can be tested without a terminal."""
 
-    HINTS = (("↑↓", "move"), ("⏎", "open"), ("tab", "bookmark"), ("ctrl-s", "bookmarked only"), ("esc", "quit"))
+    HINTS = (("↑↓", "move"), ("⏎", "open"), ("tab", "cwd/all"), ("ctrl-b", "bookmark"),
+             ("ctrl-s", "bookmarked only"), ("esc", "quit"))
 
     def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = "", color: bool = True,
-                 bookmarked: bool = False):
+                 bookmarked: bool = False, cwd: str | None = None):
         self.rows = rows
         self.query = query
         self.on_bookmark = on_bookmark
         self.scope = scope
         self.bookmarked = bookmarked  # Ctrl-S shows only bookmarked sessions.
+        self.cwd = os.path.abspath(cwd or os.getcwd())
+        self.cwd_real = os.path.realpath(self.cwd)
+        self.cwd_only = False  # Preserve hop's all-session default; Tab narrows to the current directory.
         self.color = color
         self.band = DARK_BAND
         self.index = 0
@@ -562,10 +566,13 @@ class Picker:
         self.refilter()
 
     def refilter(self) -> None:
-        # Unbookmarking a row doesn't hide it until the list is filtered again, so Tab can undo it.
+        # Unbookmarking a row doesn't hide it until the list is filtered again, so Ctrl-B can undo it.
         terms = self.query.casefold().split()
         self.visible = [row for row in self.rows
-                        if (row["bookmarked"] or not self.bookmarked) and matches(row, terms)]
+                        if (row["bookmarked"] or not self.bookmarked)
+                        and (not self.cwd_only or os.path.abspath(row["cwd"]) == self.cwd
+                             or os.path.realpath(row["cwd"]) == self.cwd_real)
+                        and matches(row, terms)]
         self.index = 0
 
     @property
@@ -587,6 +594,9 @@ class Picker:
             self.bookmarked = not self.bookmarked
             self.refilter()
         elif key == "tab":
+            self.cwd_only = not self.cwd_only
+            self.refilter()
+        elif key == "bookmark":
             row = self.selected
             if row and self.on_bookmark:
                 self.on_bookmark(row, not row["bookmarked"])
@@ -633,6 +643,7 @@ class Picker:
         self.top = max(0, min(self.top, len(self.visible) - self.page))
 
         info = [(f"{self.scope}  ", PROJECT)] if self.scope else []
+        info.append(((f"cwd {Path(self.cwd).name or self.cwd}  " if self.cwd_only else "all  "), PATH))
         if self.bookmarked:
             info.append(("★ bookmarked  ", ACCENT))
         info.append((f"{len(self.visible)}/{len(self.rows)}", DIM))

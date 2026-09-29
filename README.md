@@ -25,7 +25,7 @@ Any directory on your `PATH` works in place of `~/.local/bin`.
 hop
 ```
 
-`hop` on its own opens the picker with every session, newest first. Move to a session and press Enter to resume it.
+`hop` on its own opens the picker with every session, newest first. Move to a session and press Enter to resume it. Press Tab to switch between all sessions and sessions from the current working directory.
 
 ### Search and resume
 
@@ -143,7 +143,8 @@ The picker draws below your prompt, like `fzf --height`, and erases itself when 
 | ↑ ↓, Ctrl-P Ctrl-N | Move |
 | PgUp PgDn | Move a page |
 | Backspace, Ctrl-W, Ctrl-U | Delete a character, a word, or the whole query |
-| Tab | Toggle bookmark |
+| Tab | Show sessions from the current working directory, or all sessions again |
+| Ctrl-B | Toggle bookmark |
 | Ctrl-S | Show only bookmarked sessions, or all again |
 | Enter | Resume the session |
 | Esc, Ctrl-C | Quit |
