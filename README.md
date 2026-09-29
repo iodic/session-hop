@@ -8,10 +8,16 @@ The command is `hop`. It reads the agents' session files and never changes them.
 
 ## Install
 
-You need Python 3.11 or newer on macOS or Linux. There are no dependencies beyond the standard library.
+With Homebrew on macOS or Linux:
 
 ```bash
-git clone git@github.com:iodic/session-hop.git ~/sandbox/session-hop
+brew tap iodic/tap && brew trust --formula iodic/tap/session-hop && brew install iodic/tap/session-hop
+```
+
+Or install without Homebrew. You need Python 3.11 or newer; the standard library is enough.
+
+```bash
+git clone https://github.com/iodic/session-hop.git ~/sandbox/session-hop
 ln -s ~/sandbox/session-hop/hop ~/.local/bin/hop
 ```
 
