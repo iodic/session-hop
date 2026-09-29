@@ -3,9 +3,9 @@ class SessionHop < Formula
 
   desc "Find and resume local Pi, Claude Code, and Codex sessions"
   homepage "https://github.com/iodic/session-hop"
-  url "git@github.com:iodic/session-hop.git",
+  url "https://github.com/iodic/session-hop.git",
       using: :git,
-      revision: "161c76594265858ff8fbd5d79981476a1cc75ab2"
+      revision: "b5de5484385766a42ec4e78d258768563a00b7e8"
   version "0.1.0"
 
   depends_on "python@3.14"
