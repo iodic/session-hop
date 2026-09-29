@@ -367,6 +367,37 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(sync(self.db, self.sources), (1, 0))
         self.assertEqual([row["sid"] for row in search(self.db)], ["0199-old"])
         self.assertEqual(resolve(self.db, "codex:0199")["title"], "fix the checkout")
+        # Skipped files aren't re-read until they change.
+        with patch.object(session_hop, "parse_session", wraps=parse_session) as parsed:
+            self.assertEqual(sync(self.db, self.sources), (0, 0))
+        parsed.assert_not_called()
+
+    def test_codex_thread_continued_in_newer_file_indexed_once(self):
+        def typed(text):
+            return {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "UserMessage", "content": [{"type": "text", "text": text}]}}}
+        first = self.codex_session("01a0-long", typed("review the pull request"))
+        meta = json.loads(first.read_text().splitlines()[0])
+        later = self.write_lines(first.with_name("rollout-2026-09-28T12-00-00-01a0-long_01a0-page.jsonl"),
+                                 [meta, typed("now fix the first finding")])
+        os.utime(first, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(later, ns=(2_000_000_000, 2_000_000_000))
+        self.assertEqual(sync(self.db, self.sources)[1], 0)
+        row = resolve(self.db, "01a0-long")
+        self.assertEqual((row["source_path"], row["title"]), (str(later), "now fix the first finding"))
+        with patch.object(session_hop, "parse_session", wraps=parse_session) as parsed:
+            self.assertEqual(sync(self.db, self.sources), (0, 0))
+        parsed.assert_not_called()
+        # Losing the newest file falls back to the older one and keeps the note.
+        self.db.execute("UPDATE sessions SET note='keep'")
+        self.db.commit()
+        later.unlink()
+        self.assertEqual(sync(self.db, self.sources), (1, 0))
+        row = resolve(self.db, "01a0-long")
+        self.assertEqual((row["source_path"], row["title"], row["note"]), (str(first), "review the pull request", "keep"))
+        first.unlink()
+        self.assertEqual(sync(self.db, self.sources), (0, 1))
+        self.assertEqual(search(self.db), [])
 
     def test_sync_reports_progress_over_changed_files_only(self):
         for sid in ("a", "b", "c"):
