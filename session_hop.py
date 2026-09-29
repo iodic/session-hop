@@ -214,10 +214,17 @@ def connect(db_path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE sessions ADD COLUMN project TEXT")
     if "bookmarked" not in columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN bookmarked INTEGER NOT NULL DEFAULT 0")
+    # Every file read, including ones that aren't sessions or that continue a session in a newer file,
+    # so a scan skips them until they change. An older index seeds it rather than re-reading everything.
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'").fetchone():
+        conn.execute("""CREATE TABLE files (agent TEXT NOT NULL, path TEXT NOT NULL, sid TEXT,
+                        mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(agent, path))""")
+        conn.execute("INSERT OR IGNORE INTO files SELECT agent, source_path, sid, mtime_ns, size FROM sessions")
+        conn.commit()
     # When parsing improves, forget file stamps so the next scan re-reads every session.
     # Manual titles, notes, tags, and bookmarks are untouched.
     if conn.execute("PRAGMA user_version").fetchone()[0] < PARSER_VERSION:
-        conn.execute("UPDATE sessions SET mtime_ns=0")
+        conn.execute("DELETE FROM files")
         conn.execute(f"PRAGMA user_version={PARSER_VERSION}")
         conn.commit()
     return conn
@@ -242,7 +249,7 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path], progress=None) -> t
     removed = 0
     roots: dict[str, str] = {}
     # First find what changed, which is cheap, so progress can report a real total.
-    pending: list[tuple[str, Path, os.stat_result]] = []
+    found: list[tuple[str, Path, os.stat_result]] = []
     seen: dict[str, set[str]] = {}
     names: dict[str, dict[str, str] | None] = {}
     for agent, root in sources.items():
@@ -258,15 +265,30 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path], progress=None) -> t
             except OSError:
                 continue
             seen[agent].add(str(path))
-            old = conn.execute("SELECT mtime_ns, size FROM sessions WHERE agent=? AND source_path=?",
-                               (agent, str(path))).fetchone()
-            if not (old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size):
-                pending.append((agent, path, stat))
+            found.append((agent, path, stat))
+    for agent, paths in seen.items():
+        for row in conn.execute("SELECT path FROM files WHERE agent=?", (agent,)).fetchall():
+            if row["path"] not in paths:
+                conn.execute("DELETE FROM files WHERE agent=? AND path=?", (agent, row["path"]))
+        # A session whose file is gone falls back to its other files, keeping its annotations.
+        # With none left, it is removed after the scan.
+        for row in conn.execute("SELECT sid, source_path FROM sessions WHERE agent=?", (agent,)).fetchall():
+            if row["source_path"] not in paths:
+                conn.execute("DELETE FROM files WHERE agent=? AND sid=?", (agent, row["sid"]))
+                conn.execute("UPDATE sessions SET updated=0 WHERE agent=? AND sid=?", (agent, row["sid"]))
+    pending = []
+    for agent, path, stat in found:
+        old = conn.execute("SELECT mtime_ns, size FROM files WHERE agent=? AND path=?", (agent, str(path))).fetchone()
+        if not (old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size):
+            pending.append((agent, path, stat))
     for done, (agent, path, stat) in enumerate(pending, 1):
         if progress:
             progress(done, len(pending))
         try:
             info = parse_session(agent, path, names[agent])
+            # Files that aren't sessions are remembered too, so they aren't re-read until they change.
+            conn.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)",
+                         (agent, str(path), info and info["sid"], stat.st_mtime_ns, stat.st_size))
             if not info:
                 # Nothing worth resuming, such as a lone "/clear". Drop a stale entry unless annotated.
                 removed += conn.execute(
@@ -275,16 +297,17 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path], progress=None) -> t
                 continue
             if info["cwd"] not in roots:
                 roots[info["cwd"]] = project_root(info["cwd"])
-            conn.execute("""
+            # A long Codex thread continues in newer files under the same ID; the newest one stands for it.
+            changed += conn.execute("""
                 INSERT INTO sessions(agent, sid, cwd, title, description, source_path, mtime_ns, size, updated, project)
                 VALUES (:agent, :sid, :cwd, :title, :description, :path, :mtime_ns, :size, :updated, :project)
                 ON CONFLICT(agent, sid) DO UPDATE SET
                     cwd=excluded.cwd, title=excluded.title, description=excluded.description,
                     source_path=excluded.source_path, mtime_ns=excluded.mtime_ns,
                     size=excluded.size, updated=excluded.updated, project=excluded.project
+                WHERE excluded.source_path = sessions.source_path OR excluded.updated >= sessions.updated
             """, {**info, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "updated": stat.st_mtime,
-                  "project": roots[info["cwd"]]})
-            changed += 1
+                  "project": roots[info["cwd"]]}).rowcount
         except (OSError, ValueError, TypeError):
             continue  # A deleted or malformed file does not stop the rest of the scan.
     for agent, paths in seen.items():
