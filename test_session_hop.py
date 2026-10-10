@@ -138,7 +138,7 @@ class SessionIndexTests(unittest.TestCase):
         return code, out, Picker(rows, query, bookmarked=bookmarked).visible
 
     def pi_session(self, sid, cwd, text):
-        self.write_lines(self.pi / f"2026_{sid}.jsonl", [
+        return self.write_lines(self.pi / f"2026_{sid}.jsonl", [
             {"type": "session", "id": sid, "cwd": str(cwd)},
             {"type": "message", "message": {"role": "user", "content": text}},
         ])
@@ -396,8 +396,74 @@ class SessionIndexTests(unittest.TestCase):
         row = resolve(self.db, "01a0-long")
         self.assertEqual((row["source_path"], row["title"], row["note"]), (str(first), "review the pull request", "keep"))
         first.unlink()
+        # With every file gone the note still has nowhere to go, so the row stays as an unresumable record.
+        self.assertEqual(sync(self.db, self.sources), (0, 0))
+        row = resolve(self.db, "01a0-long")
+        self.assertEqual((row["note"], row["updated"]), ("keep", 1.0))
+
+    def codex_thread(self, sid="01a0-long"):
+        """A Codex thread whose newest file continues it, with the older file one second behind."""
+        def typed(text):
+            return {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "UserMessage", "content": [{"type": "text", "text": text}]}}}
+        first = self.codex_session(sid, typed("review the pull request"))
+        meta = json.loads(first.read_text().splitlines()[0])
+        later = self.write_lines(first.with_name(f"rollout-2026-09-28T12-00-00-{sid}_{sid[:4]}-page.jsonl"),
+                                 [meta, typed("now fix the first finding")])
+        os.utime(first, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(later, ns=(2_000_000_000, 2_000_000_000))
+        return first, later
+
+    def test_unreadable_newest_file_falls_back_to_an_unchanged_older_one(self):
+        first, later = self.codex_thread()
+        sync(self.db, self.sources)
+        self.assertEqual(resolve(self.db, "01a0-long")["source_path"], str(later))
+        # Rewritten rather than deleted, so the older file's stamp is still current and would be skipped.
+        self.write_lines(later, [json.loads(first.read_text().splitlines()[0])])
+        sync(self.db, self.sources)
+        row = resolve(self.db, "01a0-long")
+        self.assertEqual((row["source_path"], row["title"]), (str(first), "review the pull request"))
+        with patch.object(session_hop, "parse_session", wraps=parse_session) as parsed:
+            self.assertEqual(sync(self.db, self.sources), (0, 0))
+        parsed.assert_not_called()
+
+    def test_equal_mtimes_keep_one_winner_whatever_the_walk_order(self):
+        first, later = self.codex_thread()
+        sync(self.db, self.sources)
+        os.utime(first, ns=(2_000_000_000, 2_000_000_000))  # rsync -t, cp -p or a backup restore
+        sync(self.db, self.sources)
+        row = resolve(self.db, "01a0-long")
+        self.assertEqual((row["source_path"], row["title"]), (str(later), "now fix the first finding"))
+
+    def test_annotations_outlive_every_file_of_their_session(self):
+        path = self.pi_session("gone", self.project, "Task gone")
+        sync(self.db, self.sources)
+        self.db.execute("UPDATE sessions SET note='blocked on review', custom_title='keep me'")
+        self.db.commit()
+        path.unlink()
+        self.assertEqual(sync(self.db, self.sources), (0, 0))
+        row = resolve(self.db, "pi:gone")
+        self.assertEqual((row["custom_title"], row["note"]), ("keep me", "blocked on review"))
+        self.assertEqual(search(self.db, "keep me")[0]["display_note"], "blocked on review")
+        with self.assertRaisesRegex(ValueError, "no longer exists"):
+            launch(row)
+        # An unannotated session in the same state is still dropped.
+        other = self.pi_session("bye", self.project, "Task bye")
+        sync(self.db, self.sources)
+        other.unlink()
         self.assertEqual(sync(self.db, self.sources), (0, 1))
-        self.assertEqual(search(self.db), [])
+
+    def test_file_that_reports_a_new_session_id_drops_the_stale_row(self):
+        path = self.codex_session("01c0-orig", {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+            "type": "UserMessage", "content": [{"type": "text", "text": "original thread"}]}}})
+        sync(self.db, self.sources)
+        self.write_lines(path, [
+            {"type": "session_meta", "payload": {"id": "01c0-other", "cwd": str(self.project),
+                                                 "originator": "codex_cli_rs"}},
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "UserMessage", "content": [{"type": "text", "text": "different thread"}]}}}])
+        sync(self.db, self.sources)
+        self.assertEqual([row["sid"] for row in search(self.db)], ["01c0-other"])
 
     def test_sync_reports_progress_over_changed_files_only(self):
         for sid in ("a", "b", "c"):

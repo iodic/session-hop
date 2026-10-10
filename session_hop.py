@@ -216,11 +216,13 @@ def connect(db_path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE sessions ADD COLUMN bookmarked INTEGER NOT NULL DEFAULT 0")
     # Every file read, including ones that aren't sessions or that continue a session in a newer file,
     # so a scan skips them until they change. An older index seeds it rather than re-reading everything.
+    # Two processes may both see it missing; IF NOT EXISTS and OR IGNORE make the second one harmless.
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'").fetchone():
-        conn.execute("""CREATE TABLE files (agent TEXT NOT NULL, path TEXT NOT NULL, sid TEXT,
+        conn.execute("""CREATE TABLE IF NOT EXISTS files (agent TEXT NOT NULL, path TEXT NOT NULL, sid TEXT,
                         mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(agent, path))""")
         conn.execute("INSERT OR IGNORE INTO files SELECT agent, source_path, sid, mtime_ns, size FROM sessions")
         conn.commit()
+    conn.execute("CREATE INDEX IF NOT EXISTS files_sid ON files(agent, sid)")
     # When parsing improves, forget file stamps so the next scan re-reads every session.
     # Manual titles, notes, tags, and bookmarks are untouched.
     if conn.execute("PRAGMA user_version").fetchone()[0] < PARSER_VERSION:
@@ -276,20 +278,43 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path], progress=None) -> t
             if row["source_path"] not in paths:
                 conn.execute("DELETE FROM files WHERE agent=? AND sid=?", (agent, row["sid"]))
                 conn.execute("UPDATE sessions SET updated=0 WHERE agent=? AND sid=?", (agent, row["sid"]))
+    stats = {(agent, str(path)): (path, stat) for agent, path, stat in found}
     pending = []
     for agent, path, stat in found:
         old = conn.execute("SELECT mtime_ns, size FROM files WHERE agent=? AND path=?", (agent, str(path))).fetchone()
         if not (old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size):
             pending.append((agent, path, stat))
-    for done, (agent, path, stat) in enumerate(pending, 1):
+    # A cursor rather than a loop, because handing a session over appends its other files to the end.
+    queued = {(agent, str(path)) for agent, path, _ in pending}
+    done = 0
+    while done < len(pending):
+        agent, path, stat = pending[done]
+        done += 1
         if progress:
             progress(done, len(pending))
         try:
+            # The session this file stood for last scan, so one that stops standing for it can hand over.
+            was = conn.execute("SELECT sid FROM files WHERE agent=? AND path=?", (agent, str(path))).fetchone()
             info = parse_session(agent, path, names[agent])
+            # A file is remembered only once it's indexed, so a failure below retries it on the next scan.
             # Files that aren't sessions are remembered too, so they aren't re-read until they change.
-            conn.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)",
-                         (agent, str(path), info and info["sid"], stat.st_mtime_ns, stat.st_size))
+            stamp = (agent, str(path), info and info["sid"], stat.st_mtime_ns, stat.st_size)
+            if was and was["sid"] and was["sid"] != (info and info["sid"]):
+                # This file no longer stands for that session, so the row pointing here is stale. Re-read the
+                # session's other files in this scan, which a current stamp would otherwise skip forever.
+                removed += conn.execute(
+                    "DELETE FROM sessions WHERE agent=? AND sid=? AND source_path=? AND custom_title IS NULL "
+                    "AND note IS NULL AND tags='' AND bookmarked=0", (agent, was["sid"], str(path))).rowcount
+                conn.execute("UPDATE sessions SET updated=0 WHERE agent=? AND sid=? AND source_path=?",
+                             (agent, was["sid"], str(path)))
+                for row in conn.execute("SELECT path FROM files WHERE agent=? AND sid=? AND path<>?",
+                                        (agent, was["sid"], str(path))).fetchall():
+                    conn.execute("DELETE FROM files WHERE agent=? AND path=?", (agent, row["path"]))
+                    if (agent, row["path"]) in stats and (agent, row["path"]) not in queued:
+                        pending.append((agent, *stats[agent, row["path"]]))
+                        queued.add((agent, row["path"]))
             if not info:
+                conn.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)", stamp)
                 # Nothing worth resuming, such as a lone "/clear". Drop a stale entry unless annotated.
                 removed += conn.execute(
                     "DELETE FROM sessions WHERE agent=? AND source_path=? AND custom_title IS NULL "
@@ -305,19 +330,25 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path], progress=None) -> t
                     cwd=excluded.cwd, title=excluded.title, description=excluded.description,
                     source_path=excluded.source_path, mtime_ns=excluded.mtime_ns,
                     size=excluded.size, updated=excluded.updated, project=excluded.project
-                WHERE excluded.source_path = sessions.source_path OR excluded.updated >= sessions.updated
+                WHERE excluded.source_path = sessions.source_path OR excluded.updated > sessions.updated
+                   OR (excluded.updated = sessions.updated AND excluded.source_path > sessions.source_path)
             """, {**info, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "updated": stat.st_mtime,
                   "project": roots[info["cwd"]]}).rowcount
+            conn.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)", stamp)
         except (OSError, ValueError, TypeError):
             continue  # A deleted or malformed file does not stop the rest of the scan.
     for agent, paths in seen.items():
         for row in conn.execute("SELECT sid, source_path, title FROM sessions WHERE agent=?", (agent,)).fetchall():
             if row["source_path"] not in paths:
-                conn.execute("DELETE FROM sessions WHERE agent=? AND sid=?", (agent, row["sid"]))
-                removed += 1
+                # Annotations outlive their files; picking one reports the missing file instead of resuming.
+                removed += conn.execute(
+                    "DELETE FROM sessions WHERE agent=? AND sid=? AND custom_title IS NULL "
+                    "AND note IS NULL AND tags='' AND bookmarked=0", (agent, row["sid"])).rowcount
             elif names[agent] and (name := clean(names[agent].get(row["sid"], ""), 100)) and name != row["title"]:
                 # Renaming a Codex thread doesn't touch its session file, so apply names on every scan.
                 conn.execute("UPDATE sessions SET title=? WHERE agent=? AND sid=?", (name, agent, row["sid"]))
+    # A fallback that found no replacement keeps its last known time rather than sorting as 1970.
+    conn.execute("UPDATE sessions SET updated=mtime_ns/1000000000.0 WHERE updated=0 AND mtime_ns>0")
     # Rows indexed before project support are unchanged on disk, so fill them in here.
     for row in conn.execute("SELECT agent, sid, cwd FROM sessions WHERE project IS NULL").fetchall():
         if row["cwd"] not in roots:
