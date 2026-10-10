@@ -23,6 +23,30 @@ ln -s ~/sandbox/session-hop/hop ~/.local/bin/hop
 
 Any directory on your `PATH` works in place of `~/.local/bin`.
 
+### Install the agent skill
+
+After installing the `hop` command, install the skill globally for Pi, Claude Code, and Codex:
+
+```bash
+npx skills add iodic/session-hop --global --agent pi claude-code codex --skill hop --yes
+```
+
+Invoke it with an optional bookmark note:
+
+| Agent | Invocation |
+|---|---|
+| Pi | `/skill:hop finish the tests` |
+| Claude Code | `/hop finish the tests` |
+| Codex | `$hop finish the tests`, or select `hop` from `/skills` |
+
+Each agent exposes its current session ID to shell tools. The skill uses `PI_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, or `CODEX_THREAD_ID`, so it bookmarks the session that invoked it rather than guessing from recency. It falls back to `CODEX_SESSION_ID` when a Codex host provides that name instead.
+
+For Pi only, installing the repository as a personal Pi package also adds the shorter `/hop` prompt:
+
+```bash
+pi install git:github.com/iodic/session-hop.git
+```
+
 ## Usage
 
 ### Browse everything
