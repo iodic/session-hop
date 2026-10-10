@@ -136,7 +136,7 @@ class SessionIndexTests(unittest.TestCase):
         if not shown.called:
             return code, out, []
         rows, query, _, bookmarked = shown.call_args.args[1:5]
-        return code, out, Picker(rows, query, bookmarked=bookmarked).visible
+        return code, out, Picker(rows, query, bookmarked=bookmarked, **shown.call_args.kwargs).visible
 
     def pi_session(self, sid, cwd, text):
         return self.write_lines(self.pi / f"2026_{sid}.jsonl", [
@@ -156,6 +156,14 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([row["display_title"] for row in shown], ["Billbee invoices"])
         self.assertEqual(self.cli("billbee", terminal=False)[0], 1)  # No list output without a terminal.
+
+    def test_dot_starts_in_the_current_directory(self):
+        self.pi_session("here", self.project, "Billbee here")
+        self.pi_session("there", self.root, "Billbee there")
+        with patch("os.getcwd", return_value=str(self.project)):
+            self.assertEqual([row["sid"] for row in self.cli(".")[2]], ["here"])
+            self.assertEqual([row["sid"] for row in self.cli(".", "billbee")[2]], ["here"])
+            self.assertEqual(len(self.cli("billbee")[2]), 2)
 
     def test_project_root_recorded_and_filterable(self):
         repo = self.root / "billbee-api"

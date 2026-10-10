@@ -603,7 +603,7 @@ class Picker:
              ("ctrl-s", "bookmarked only"), ("esc", "quit"))
 
     def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = "", color: bool = True,
-                 bookmarked: bool = False, cwd: str | None = None):
+                 bookmarked: bool = False, cwd: str | None = None, cwd_only: bool = False):
         self.rows = rows
         self.query = query
         self.on_bookmark = on_bookmark
@@ -611,7 +611,7 @@ class Picker:
         self.bookmarked = bookmarked  # Ctrl-S shows only bookmarked sessions.
         self.cwd = os.path.abspath(cwd or os.getcwd())
         self.cwd_real = os.path.realpath(self.cwd)
-        self.cwd_only = False  # Preserve hop's all-session default; Tab narrows to the current directory.
+        self.cwd_only = cwd_only  # All sessions by default; Tab or "hop ." narrows to the current directory.
         self.color = color
         self.band = DARK_BAND
         self.index = 0
@@ -780,10 +780,11 @@ def light_background(fd_in: int, fd_out: int) -> tuple[bool, bytes]:
 
 
 def picker(conn: sqlite3.Connection, rows: list[dict], query: str = "", scope: str = "",
-           bookmarked: bool = False) -> dict | None:
+           bookmarked: bool = False, cwd_only: bool = False) -> dict | None:
     """fzf-style inline picker: draws a few lines below the prompt and erases them on exit."""
     color = not os.environ.get("NO_COLOR")
-    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope, color, bookmarked)
+    state = Picker(rows, query, lambda row, value: set_bookmark(conn, row, value), scope, color, bookmarked,
+                   cwd_only=cwd_only)
     fd_in, fd_out = sys.stdin.fileno(), sys.stdout.fileno()
     size = os.get_terminal_size(fd_out)
     height = max(7, min(size.lines - 1, len(rows) + 6, max(12, size.lines * 2 // 5)))
@@ -862,7 +863,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True, prog="hop")
     sub.add_parser("sync", help="Index new and changed sessions")
     pick = sub.add_parser("pick", help="Choose a session and resume it (default)")
-    pick.add_argument("query", nargs="*", help="Words in title, note, path, tags, or ID")
+    pick.add_argument("query", nargs="*", help="Words in title, note, path, tags, or ID; '.' starts in the current directory")
     pick.add_argument("-p", "--project", help="Project name, or a path such as '.' for the current checkout")
     pick.add_argument("-b", "--bookmarked", action="store_true", help="Only bookmarked sessions")
     pick.add_argument("--limit", type=int, help="Show at most this many of the newest sessions")
@@ -900,10 +901,13 @@ def main(argv: list[str] | None = None) -> int:
                 # The picker filters as you type, so it starts from every candidate.
                 # -b only starts the picker in bookmarked mode, so Ctrl-S can still show everything.
                 rows = search(conn, "", args.limit, project=args.project)
+                # "hop ." starts with Tab's current-directory view on; Tab still switches back to all.
+                words = [word for word in args.query if word != "."]
                 if not rows:
                     print("No sessions found.")
-                elif selected := picker(conn, rows, " ".join(args.query),
-                                        f"project {args.project}" if args.project else "", args.bookmarked):
+                elif selected := picker(conn, rows, " ".join(words),
+                                        f"project {args.project}" if args.project else "", args.bookmarked,
+                                        cwd_only=len(words) < len(args.query)):
                     launch(selected)
             elif args.command == "open":
                 scan(conn, sources)

@@ -57,6 +57,12 @@ hop
 
 `hop` on its own opens the picker with every session, newest first. Move to a session and press Enter to resume it. Press Tab to switch between all sessions and sessions from the current working directory.
 
+```bash
+hop .
+```
+
+`hop .` opens the picker with that switch already on, showing only sessions from the current working directory. Press Tab to see all sessions again. Words after the dot still filter: `hop . payments`.
+
 ### Search and resume
 
 ```bash
