@@ -113,7 +113,7 @@ hop -b
 hop bm 01a0da86 "finish the tests"
 ```
 
-This bookmarks the session whose ID starts with `01a0da86`. Bookmarked sessions show a `★` in the list. The note is optional; when you give one, it replaces the session's description. In the picker, Tab toggles the bookmark on the highlighted row.
+This bookmarks the session whose ID starts with `01a0da86`. Bookmarked sessions show a `★` in the list. The note is optional; when you give one, it replaces the session's description. In the picker, Ctrl-B toggles the bookmark on the highlighted row.
 
 ```bash
 hop unbm 01a0da86
