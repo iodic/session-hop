@@ -272,46 +272,46 @@ def sync(conn: sqlite3.Connection, sources: dict[str, Path], progress=None) -> t
         for row in conn.execute("SELECT path FROM files WHERE agent=?", (agent,)).fetchall():
             if row["path"] not in paths:
                 conn.execute("DELETE FROM files WHERE agent=? AND path=?", (agent, row["path"]))
-        # A session whose file is gone falls back to its other files, keeping its annotations.
-        # With none left, it is removed after the scan.
+        # A session whose file is gone falls back to its other files. With none left it is dropped after
+        # the scan, unless it carries a title, note, tag or bookmark worth keeping without a file.
         for row in conn.execute("SELECT sid, source_path FROM sessions WHERE agent=?", (agent,)).fetchall():
             if row["source_path"] not in paths:
                 conn.execute("DELETE FROM files WHERE agent=? AND sid=?", (agent, row["sid"]))
                 conn.execute("UPDATE sessions SET updated=0 WHERE agent=? AND sid=?", (agent, row["sid"]))
     stats = {(agent, str(path)): (path, stat) for agent, path, stat in found}
+    # The remembered ID comes along, so a file that stops standing for that session can hand over.
     pending = []
     for agent, path, stat in found:
-        old = conn.execute("SELECT mtime_ns, size FROM files WHERE agent=? AND path=?", (agent, str(path))).fetchone()
+        old = conn.execute("SELECT sid, mtime_ns, size FROM files WHERE agent=? AND path=?",
+                           (agent, str(path))).fetchone()
         if not (old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size):
-            pending.append((agent, path, stat))
+            pending.append((agent, path, stat, old["sid"] if old else None))
     # A cursor rather than a loop, because handing a session over appends its other files to the end.
-    queued = {(agent, str(path)) for agent, path, _ in pending}
+    queued = {(agent, str(path)) for agent, path, _, _ in pending}
     done = 0
     while done < len(pending):
-        agent, path, stat = pending[done]
+        agent, path, stat, was = pending[done]
         done += 1
         if progress:
             progress(done, len(pending))
         try:
-            # The session this file stood for last scan, so one that stops standing for it can hand over.
-            was = conn.execute("SELECT sid FROM files WHERE agent=? AND path=?", (agent, str(path))).fetchone()
             info = parse_session(agent, path, names[agent])
             # A file is remembered only once it's indexed, so a failure below retries it on the next scan.
             # Files that aren't sessions are remembered too, so they aren't re-read until they change.
             stamp = (agent, str(path), info and info["sid"], stat.st_mtime_ns, stat.st_size)
-            if was and was["sid"] and was["sid"] != (info and info["sid"]):
+            if was and was != (info and info["sid"]):
                 # This file no longer stands for that session, so the row pointing here is stale. Re-read the
                 # session's other files in this scan, which a current stamp would otherwise skip forever.
                 removed += conn.execute(
                     "DELETE FROM sessions WHERE agent=? AND sid=? AND source_path=? AND custom_title IS NULL "
-                    "AND note IS NULL AND tags='' AND bookmarked=0", (agent, was["sid"], str(path))).rowcount
+                    "AND note IS NULL AND tags='' AND bookmarked=0", (agent, was, str(path))).rowcount
                 conn.execute("UPDATE sessions SET updated=0 WHERE agent=? AND sid=? AND source_path=?",
-                             (agent, was["sid"], str(path)))
+                             (agent, was, str(path)))
                 for row in conn.execute("SELECT path FROM files WHERE agent=? AND sid=? AND path<>?",
-                                        (agent, was["sid"], str(path))).fetchall():
+                                        (agent, was, str(path))).fetchall():
                     conn.execute("DELETE FROM files WHERE agent=? AND path=?", (agent, row["path"]))
                     if (agent, row["path"]) in stats and (agent, row["path"]) not in queued:
-                        pending.append((agent, *stats[agent, row["path"]]))
+                        pending.append((agent, *stats[agent, row["path"]], None))
                         queued.add((agent, row["path"]))
             if not info:
                 conn.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)", stamp)
