@@ -1,7 +1,8 @@
 ---
 name: hop
 description: Bookmark the current Pi, Claude Code, or Codex session in Session Hop, optionally with a note. Use when the user asks to bookmark, save, pin, or mark the current agent session in Hop.
-compatibility: Requires Python 3.11+ and Session Hop on PATH or in the containing package. The agent shell must expose PI_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, or CODEX_SESSION_ID.
+compatibility: For Pi, Claude Code, and Codex. Needs the Session Hop hop command on PATH or in the containing package, Python 3.11+ to run it, and a host that exports PI_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, or CODEX_SESSION_ID.
+allowed-tools: Bash
 ---
 
 # Hop
