@@ -131,6 +131,16 @@ This tags session `01a0da86` with `payments`. Tags are extra search words. Each 
 
 Titles, notes, tags, and bookmarks you set survive rescans.
 
+### Forget a session
+
+```bash
+hop forget 01a0da86
+```
+
+This drops session `01a0da86` from the index along with its title, note, tags, and bookmark. Use it on a session whose files are gone and whose record you no longer want.
+
+If the session file is still on disk, the next scan indexes it again, without anything you had set on it. `forget` tells you when that will happen.
+
 ### Refresh the index
 
 ```bash
@@ -183,7 +193,7 @@ The index is an SQLite file at `~/.local/share/session-hop/index.sqlite3`, or un
 
 The index holds working directories and short excerpts of your messages, so treat it as private. Session Hop creates it with mode `0600`. It never stores full transcripts, tool output, or model responses.
 
-When a session file disappears, the next scan drops its entry. If a whole source folder is missing, for example on an unmounted disk, its entries stay.
+When a session file disappears, the next scan drops its entry. A session kept in more than one file falls back to the ones that remain. An entry you gave a title, note, tag, or bookmark stays as a record of work you marked, and picking it says the file is gone rather than resuming; `hop forget` removes it. If a whole source folder is missing, for example on an unmounted disk, its entries stay.
 
 ## Development
 

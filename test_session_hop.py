@@ -480,6 +480,36 @@ class SessionIndexTests(unittest.TestCase):
             # The age column is right-aligned, so the header label and the date share a right edge.
             self.assertEqual(cells(plain[1].rstrip()), cells(plain[2].rstrip()))
 
+    def test_forget_drops_a_fileless_record_and_resets_a_live_one(self):
+        db = self.root / "cli.sqlite3"
+        path = self.pi_session("gone", self.project, "Task gone")
+        self.cli("sync")
+        with connect(db) as conn:
+            conn.execute("UPDATE sessions SET note='blocked on review', custom_title='keep me'")
+        path.unlink()
+        self.cli("sync")  # The annotations keep the row alive with no file left.
+        code, out, _ = self.cli("forget", "pi:gone")
+        self.assertEqual((code, "still there" in out), (0, False))
+        self.assertIn("Forgot pi:gone.", out)
+        self.cli("sync")
+        with connect(db) as conn:
+            self.assertEqual(search(conn), [])  # Nothing on disk to bring it back.
+        # One whose file is still there returns on the next scan, without what was set on it.
+        self.pi_session("live", self.project, "Task live")
+        self.cli("sync")
+        with connect(db) as conn:
+            conn.execute("UPDATE sessions SET note='mine' WHERE sid='live'")
+        code, out, _ = self.cli("forget", "live")
+        self.assertEqual(code, 0)
+        self.assertIn("still there", out)
+        with connect(db) as conn:
+            self.assertEqual(search(conn), [])
+        self.cli("sync")
+        with connect(db) as conn:
+            row = resolve(conn, "pi:live")
+            self.assertEqual((row["title"], row["note"]), ("Task live", None))
+        self.assertEqual(self.cli("forget", "pi:gone")[0], 1)  # Nothing left to forget.
+
     def test_sync_reports_progress_over_changed_files_only(self):
         for sid in ("a", "b", "c"):
             self.pi_session(sid, self.project, f"Task {sid}")

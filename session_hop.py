@@ -827,7 +827,8 @@ def launch(row: sqlite3.Row) -> None:
     os.execvp(argv[0], argv)
 
 
-COMMANDS = {"sync", "pick", "open", "rename", "title", "note", "tag", "bookmark", "bm", "unbookmark", "unbm"}
+COMMANDS = {"sync", "pick", "open", "rename", "title", "note", "tag", "bookmark", "bm", "unbookmark", "unbm",
+            "forget"}
 GLOBAL_OPTIONS = {"--db", "--pi-dir", "--claude-dir", "--codex-dir"}
 
 
@@ -878,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
     mark.add_argument("text", nargs="*", help="Optional note, e.g. what still needs doing")
     unmark = sub.add_parser("unbookmark", aliases=["unbm"], help="Remove a bookmark")
     unmark.add_argument("id")
+    forget = sub.add_parser("forget", help="Drop a session from the index, including what you set on it")
+    forget.add_argument("id")
     args = parser.parse_args(with_default_command(sys.argv[1:] if argv is None else list(argv)))
     if args.command == "pick" and args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
@@ -915,6 +918,17 @@ def main(argv: list[str] | None = None) -> int:
                                  (clean(" ".join(args.text), 500), row["agent"], row["sid"]))
                     conn.commit()
                 print(f"{'Bookmarked' if adding else 'Removed bookmark from'} {row['agent']}:{row['sid']}.")
+            elif args.command == "forget":
+                scan(conn, sources)
+                row = resolve(conn, args.id)
+                conn.execute("DELETE FROM sessions WHERE agent=? AND sid=?", (row["agent"], row["sid"]))
+                # Its file stamps go too, so a session still on disk is read fresh rather than
+                # staying invisible until it changes. Keeping them would hide it for good.
+                conn.execute("DELETE FROM files WHERE agent=? AND sid=?", (row["agent"], row["sid"]))
+                conn.commit()
+                print(f"Forgot {row['agent']}:{row['sid']}."
+                      + (" Its file is still there, so the next scan indexes it again without your title, "
+                         "note, tags, or bookmark." if Path(row["source_path"]).is_file() else ""))
             else:
                 scan(conn, sources)
                 row = resolve(conn, args.id)
