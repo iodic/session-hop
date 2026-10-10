@@ -1,6 +1,7 @@
 import io
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import time
@@ -11,8 +12,8 @@ import re
 import sqlite3
 
 import session_hop
-from session_hop import (Picker, Spinner, cells, connect, luminance, launch, main, parse_session, prompt_text, resolve, search,
-                           split_keys, sync, with_default_command)
+from session_hop import (Picker, Spinner, age, cells, connect, luminance, launch, main, parse_session, prompt_text,
+                           resolve, search, split_keys, sync, with_default_command)
 
 
 class SessionIndexTests(unittest.TestCase):
@@ -464,6 +465,20 @@ class SessionIndexTests(unittest.TestCase):
                 "type": "UserMessage", "content": [{"type": "text", "text": "different thread"}]}}}])
         sync(self.db, self.sources)
         self.assertEqual([row["sid"] for row in search(self.db)], ["01c0-other"])
+
+    def test_picker_keeps_the_whole_month_and_day_age(self):
+        now = datetime.now().timestamp()
+        rows = [{"agent": "claude", "sid": "id0", "cwd": "/p", "project": "/p", "display_title": "Task " + "x" * 40,
+                 "display_note": "note", "tags": "", "bookmarked": False, "updated": now - 30 * 86400}]
+        stamp = age(rows[0]["updated"], now)
+        self.assertEqual(len(stamp), 6)  # "Sep 02" is the widest age the picker renders.
+        for width in (60, 80):
+            lines, _ = Picker(rows).render(width, 9)
+            plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
+            self.assertTrue(all(cells(line) <= width - 1 for line in plain))
+            self.assertIn(stamp, plain[2])  # Not clipped to "Sep 0".
+            # The age column is right-aligned, so the header label and the date share a right edge.
+            self.assertEqual(cells(plain[1].rstrip()), cells(plain[2].rstrip()))
 
     def test_sync_reports_progress_over_changed_files_only(self):
         for sid in ("a", "b", "c"):

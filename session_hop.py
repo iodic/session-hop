@@ -671,7 +671,7 @@ class Picker:
     @staticmethod
     def title_width(width: int) -> int:
         # Star, agent, project and their gaps on the left; age right-aligned at the edge.
-        return max(5, width - 2 - 9 - 20 - 5)
+        return max(5, width - 2 - 9 - 20 - 6)
 
     def row_segments(self, row: dict, chosen: bool, now: float, width: int) -> list[tuple[str, str]]:
         """Selection is every column in bold, plus a colored age; no band or bar."""
@@ -683,7 +683,7 @@ class Picker:
             (fit(project, 18) + "  ", PROJECT if chosen else PATH),
             *highlight(fit(row["display_title"], self.title_width(width)), self.query.lower().split(),
                        title, HIT + (";1" if chosen else "")),
-            (f"{age(row['updated'], now):>5}", f"{BOLD};{AGE}" if chosen else DIM),
+            (f"{age(row['updated'], now):>6}", f"{BOLD};{AGE}" if chosen else DIM),
         ]
 
     def render(self, width: int, height: int) -> tuple[list[str], int]:
@@ -704,7 +704,7 @@ class Picker:
         prompt = [("❯ ", ACCENT), (self.query, BOLD)]
         gap = width - sum(cells(text) for text, _ in prompt + info)
         lines = [self.paint(prompt + ([(" " * gap, "")] + info if gap > 0 else []), width),
-                 self.paint([(f"  {'agent':<9}{fit('project', 18)}  {fit('title', self.title_width(width))}{'age':>5}",
+                 self.paint([(f"  {'agent':<9}{fit('project', 18)}  {fit('title', self.title_width(width))}{'age':>6}",
                               DIM)], width)]
 
         now = datetime.now().timestamp()
