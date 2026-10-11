@@ -4,7 +4,7 @@ class SessionHop < Formula
   desc "Find and resume local Pi, Claude Code, and Codex sessions"
   homepage "https://github.com/iodic/session-hop"
   url "https://github.com/iodic/session-hop.git",
-      using: :git,
+      using:    :git,
       tag:      "v0.2.0",
       revision: "b7f5ccaf3c0876a9dce287ee31bd965cce48fd17"
 
