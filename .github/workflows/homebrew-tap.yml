@@ -1,0 +1,80 @@
+name: Update Homebrew tap
+
+# Points iodic/homebrew-tap's formula at a release tag, then audits, installs,
+# and tests it before pushing. The formula itself lives only in the tap.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, such as v0.2.0
+        required: true
+      push:
+        description: Push the formula change to the tap
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+
+jobs:
+  update:
+    runs-on: macos-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      PUSH: ${{ github.event_name == 'push' || inputs.push }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Resolve the tagged commit
+        run: |
+          # An annotated tag lists its peeled commit (^{}) last.
+          REV=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -n 1 | cut -f 1)
+          if [ -z "$REV" ]; then
+            echo "::error::Tag ${TAG} not found"
+            exit 1
+          fi
+          echo "REV=${REV}" >> "$GITHUB_ENV"
+          echo "${TAG} -> ${REV}"
+
+      - name: Check out the tap
+        uses: actions/checkout@v5
+        with:
+          repository: iodic/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Point the formula at the tag
+        working-directory: tap
+        run: |
+          sed -i '' -E \
+            -e "s/^(      tag: +)\"[^\"]*\"/\1\"${TAG}\"/" \
+            -e "s/^(      revision: )\"[0-9a-f]*\"/\1\"${REV}\"/" \
+            Formula/session-hop.rb
+          grep -q "tag:      \"${TAG}\"" Formula/session-hop.rb
+          grep -q "revision: \"${REV}\"" Formula/session-hop.rb
+          git diff
+          if ! git diff --quiet; then
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit -am "feat(formula): update Session Hop to ${TAG#v}"
+          fi
+
+      - name: Audit, install, and test the formula
+        run: |
+          brew tap iodic/tap "${GITHUB_WORKSPACE}/tap"
+          brew audit --formula iodic/tap/session-hop
+          brew install iodic/tap/session-hop
+          brew test iodic/tap/session-hop
+          brew list --versions session-hop
+
+      - name: Push to the tap
+        if: env.PUSH == 'true'
+        working-directory: tap
+        run: git push origin HEAD:main
