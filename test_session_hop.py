@@ -157,13 +157,63 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual([row["display_title"] for row in shown], ["Billbee invoices"])
         self.assertEqual(self.cli("billbee", terminal=False)[0], 1)  # No list output without a terminal.
 
-    def test_dot_starts_in_the_current_directory(self):
+    def test_dot_starts_in_the_current_project(self):
         self.pi_session("here", self.project, "Billbee here")
         self.pi_session("there", self.root, "Billbee there")
         with patch("os.getcwd", return_value=str(self.project)):
             self.assertEqual([row["sid"] for row in self.cli(".")[2]], ["here"])
             self.assertEqual([row["sid"] for row in self.cli(".", "billbee")[2]], ["here"])
             self.assertEqual(len(self.cli("billbee")[2]), 2)
+
+    def test_dot_and_tab_include_sessions_from_project_subdirectories(self):
+        repo = self.root / "tesori"
+        theme = repo / "wp-content" / "themes" / "tesori"
+        (repo / ".git").mkdir(parents=True)
+        theme.mkdir(parents=True)
+        self.pi_session("root", repo, "Tesori design")
+        self.write_lines(self.claude / "tesori" / "theme.jsonl", [
+            {"type": "user", "sessionId": "theme", "cwd": str(theme),
+             "message": {"content": "Tesori product page redesign review + estimate"}},
+        ])
+        self.pi_session("other", self.root / "tesori-other", "Another design")
+        sync(self.db, self.sources)
+        rows = search(self.db)
+        for cwd in (repo, theme):
+            with self.subTest(cwd=cwd), patch("os.getcwd", return_value=str(cwd)):
+                self.assertEqual({r["sid"] for r in self.cli(".", "design")[2]}, {"root", "theme"})
+                picker = Picker(rows, "design", color=False)
+                self.assertEqual({r["sid"] for r in picker.visible}, {"root", "theme", "other"})
+                picker.handle("tab")
+                self.assertEqual({r["sid"] for r in picker.visible}, {"root", "theme"})
+                self.assertIn("project tesori", picker.render(100, 10)[0][0])
+                self.assertIn("project/all", picker.render(100, 10)[0][-1])
+                picker.handle("tab")
+                self.assertEqual({r["sid"] for r in picker.visible}, {"root", "theme", "other"})
+
+    def test_current_project_and_path_filter_match_symlinks_both_ways(self):
+        repo = self.root / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        alias = self.root / "alias"
+        alias.symlink_to(repo, target_is_directory=True)
+        self.pi_session("real", repo / "src", "Design real")
+        self.pi_session("alias", alias / "src", "Design alias")
+        sync(self.db, self.sources)
+        for cwd in (repo, alias):
+            with self.subTest(cwd=cwd):
+                self.assertEqual({r["sid"] for r in search(self.db, project=str(cwd))}, {"real", "alias"})
+                picker = Picker(search(self.db), cwd=str(cwd), cwd_only=True)
+                self.assertEqual({r["sid"] for r in picker.visible}, {"real", "alias"})
+
+    def test_current_project_outside_git_uses_directory_boundary(self):
+        child = self.project / "child"
+        child.mkdir()
+        self.pi_session("root", self.project, "Root")
+        self.pi_session("child", child, "Child")
+        self.pi_session("sibling", self.root / "project-other", "Sibling")
+        sync(self.db, self.sources)
+        picker = Picker(search(self.db), cwd=str(self.project), cwd_only=True)
+        self.assertEqual({r["sid"] for r in picker.visible}, {"root", "child"})
 
     def test_project_root_recorded_and_filterable(self):
         repo = self.root / "billbee-api"
@@ -229,7 +279,7 @@ class SessionIndexTests(unittest.TestCase):
         self.assertEqual(len(picker.visible), 3)
         picker.handle("tab")
         self.assertEqual([r["sid"] for r in picker.visible], ["a", "b"])
-        self.assertIn("cwd p", picker.render(80, 9)[0][0])
+        self.assertIn("project p", picker.render(80, 9)[0][0])
         picker.handle("tab")
         self.assertEqual(len(picker.visible), 3)
         self.assertEqual(picker.handle("esc"), "quit")

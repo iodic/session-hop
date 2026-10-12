@@ -55,13 +55,13 @@ pi install git:github.com/iodic/session-hop.git
 hop
 ```
 
-`hop` on its own opens the picker with every session, newest first. Move to a session and press Enter to resume it. Press Tab to switch between all sessions and sessions from the current working directory.
+`hop` on its own opens the picker with every session, newest first. Move to a session and press Enter to resume it. Press Tab to switch between all sessions and sessions from the current project.
 
 ```bash
 hop .
 ```
 
-`hop .` opens the picker with that switch already on, showing only sessions from the current working directory. Press Tab to see all sessions again. Words after the dot still filter: `hop . payments`.
+`hop .` opens the picker with that switch already on, showing sessions from the current Git checkout, including its subdirectories. Outside a checkout, it shows sessions from the current directory and its subdirectories. This uses the same project filter as `-p .`. Press Tab to see all sessions again. Words after the dot still filter: `hop . payments`.
 
 ### Search and resume
 
@@ -189,7 +189,7 @@ The picker draws below your prompt, like `fzf --height`, and erases itself when 
 | ↑ ↓, Ctrl-P Ctrl-N | Move |
 | PgUp PgDn | Move a page |
 | Backspace, Ctrl-W, Ctrl-U | Delete a character, a word, or the whole query |
-| Tab | Show sessions from the current working directory, or all sessions again |
+| Tab | Show sessions from the current project, or all sessions again |
 | Ctrl-B | Toggle bookmark |
 | Ctrl-S | Show only bookmarked sessions, or all again |
 | Enter | Resume the session |

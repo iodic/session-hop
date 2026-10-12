@@ -436,7 +436,8 @@ def in_project(value: str):
         # Agents may record either side of a symlink such as /var -> /private/var.
         roots = {project_root(path), project_root(os.path.realpath(path))}
         prefixes = tuple(root.rstrip(os.sep) + os.sep for root in roots)
-        return lambda row: row["cwd"] in roots or row["cwd"].startswith(prefixes)
+        return lambda row: any(cwd in roots or cwd.startswith(prefixes)
+                               for cwd in (os.path.abspath(row["cwd"]), os.path.realpath(row["cwd"])))
     name = value.casefold()
     return lambda row: name in Path(row["project"] or row["cwd"]).name.casefold()
 
@@ -599,7 +600,7 @@ def split_keys(data: str) -> list[str]:
 class Picker:
     """Filter-as-you-type session list. Renders to strings so it can be tested without a terminal."""
 
-    HINTS = (("↑↓", "move"), ("⏎", "open"), ("tab", "cwd/all"), ("ctrl-b", "bookmark"),
+    HINTS = (("↑↓", "move"), ("⏎", "open"), ("tab", "project/all"), ("ctrl-b", "bookmark"),
              ("ctrl-s", "bookmarked only"), ("esc", "quit"))
 
     def __init__(self, rows: list[dict], query: str = "", on_bookmark=None, scope: str = "", color: bool = True,
@@ -610,8 +611,9 @@ class Picker:
         self.scope = scope
         self.bookmarked = bookmarked  # Ctrl-S shows only bookmarked sessions.
         self.cwd = os.path.abspath(cwd or os.getcwd())
-        self.cwd_real = os.path.realpath(self.cwd)
-        self.cwd_only = cwd_only  # All sessions by default; Tab or "hop ." narrows to the current directory.
+        self.current_project = project_root(self.cwd)
+        self.keep_project = in_project(self.cwd)
+        self.cwd_only = cwd_only  # All sessions by default; Tab or "hop ." narrows to the current project.
         self.color = color
         self.band = DARK_BAND
         self.index = 0
@@ -624,8 +626,7 @@ class Picker:
         terms = self.query.casefold().split()
         self.visible = [row for row in self.rows
                         if (row["bookmarked"] or not self.bookmarked)
-                        and (not self.cwd_only or os.path.abspath(row["cwd"]) == self.cwd
-                             or os.path.realpath(row["cwd"]) == self.cwd_real)
+                        and (not self.cwd_only or self.keep_project(row))
                         and matches(row, terms)]
         self.index = 0
 
@@ -697,7 +698,8 @@ class Picker:
         self.top = max(0, min(self.top, len(self.visible) - self.page))
 
         info = [(f"{self.scope}  ", PROJECT)] if self.scope else []
-        info.append(((f"cwd {Path(self.cwd).name or self.cwd}  " if self.cwd_only else "all  "), PATH))
+        info.append(((f"project {Path(self.current_project).name or self.current_project}  "
+                      if self.cwd_only else "all  "), PATH))
         if self.bookmarked:
             info.append(("★ bookmarked  ", ACCENT))
         info.append((f"{len(self.visible)}/{len(self.rows)}", DIM))
@@ -863,7 +865,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True, prog="hop")
     sub.add_parser("sync", help="Index new and changed sessions")
     pick = sub.add_parser("pick", help="Choose a session and resume it (default)")
-    pick.add_argument("query", nargs="*", help="Words in title, note, path, tags, or ID; '.' starts in the current directory")
+    pick.add_argument("query", nargs="*", help="Words in title, note, path, tags, or ID; '.' starts in the current project")
     pick.add_argument("-p", "--project", help="Project name, or a path such as '.' for the current checkout")
     pick.add_argument("-b", "--bookmarked", action="store_true", help="Only bookmarked sessions")
     pick.add_argument("--limit", type=int, help="Show at most this many of the newest sessions")
@@ -901,7 +903,7 @@ def main(argv: list[str] | None = None) -> int:
                 # The picker filters as you type, so it starts from every candidate.
                 # -b only starts the picker in bookmarked mode, so Ctrl-S can still show everything.
                 rows = search(conn, "", args.limit, project=args.project)
-                # "hop ." starts with Tab's current-directory view on; Tab still switches back to all.
+                # "hop ." starts with Tab's current-project view on; Tab still switches back to all.
                 words = [word for word in args.query if word != "."]
                 if not rows:
                     print("No sessions found.")
